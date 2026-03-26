@@ -20,7 +20,7 @@ import urllib3
 
 # --- [RAG 관련 라이브러리 통합] ---
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from CustomParentDocumentRetriever import CustomParentDocumentRetriever as ParentDocumentRetriever
@@ -52,6 +52,9 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import schedule
 
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
 # ---------------------------------------------------------
 # 1. 설정 및 초기화 (Configuration & Init)
 # ---------------------------------------------------------
@@ -75,7 +78,7 @@ APP_KEY = os.getenv('APP_KEY')
 APP_SECRET = os.getenv('APP_SECRET')
 TOKEN_URL = f"{API_BASE_URL}/oauth2/token"
 ACCESS_TOKEN_EXPIRES_AT = 0
-TOTAL_CAPITAL = int(os.environ.get('TOTAL_CAPITAL', 100000000)) * 0.6
+TOTAL_CAPITAL = int(os.environ.get('TOTAL_CAPITAL', 100000000)) * 2
 
 # --- NEW: Mini Future settings ---
 MINI_FUTURE_FOCODE = os.getenv("MINI_FUTURE_FOCODE", "").strip()
@@ -86,27 +89,138 @@ MINI_FUTURE_INIT_MARGIN = float(os.getenv("MINI_FUTURE_INIT_MARGIN", "2500000"))
 # OPEN_AI_KEY = os.getenv('OPEN_AI_KEY')
 # llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, api_key=OPEN_AI_KEY)
 
-# --- 수정 후 (최대한 코드 유지) ---
+LLM_BASE_URL = "http://localhost:8080/v1"
+EMBED_BASE_URL = "http://localhost:8081/v1"
+
 llm = ChatOpenAI(
-    model="local-llama",             # 로컬 서버에 로드된 모델명 (보통 무시되지만 필수 입력)
-    base_url="http://localhost:8090/v1", # 로컬 Llama 서버 주소
-    api_key="no-key-needed",         # 로컬 서버는 키가 필요 없어도 형식상 입력
+    model="local-llama",
+    base_url=LLM_BASE_URL,
+    api_key="no-key-needed",
     temperature=0.0,
-    timeout=600,  # 로컬 추론 속도를 고려해 타임아웃 넉넉히 설정
-    streaming=True
+    timeout=600,
+    streaming=False
 )
 
-# --- 수정 전 ---
-# embeddings = OpenAIEmbeddings(api_key=OPEN_AI_KEY)
-
-# --- 수정 후 (로컬 서버 설정 적용) ---
 embeddings = OpenAIEmbeddings(
-    model="local-model",              # 로컬 서버에 로드된 임베딩 모델명 (보통 자동 인식됨)
-    base_url="http://localhost:8090/v1", # 로컬 Llama/vLLM 서버 주소
-    api_key="no-key-needed"           # 로컬 서버는 키가 필요 없어도 형식상 입력
+    model="local-model",
+    base_url=EMBED_BASE_URL,
+    api_key="no-key-needed"
 )
 
 scenario_title = ''
+
+
+def clean_model_output(text: str) -> str:
+    if not text:
+        return ""
+
+    text = str(text).strip()
+
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    bad_patterns = [
+        r"Thinking Process:.*",
+        r"Analyze the Request:.*",
+        r"Analyze the Input Text:.*",
+    ]
+    for pattern in bad_patterns:
+        text = re.sub(pattern, "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"^```\s*", "", text).strip()
+    text = re.sub(r"\s*```$", "", text).strip()
+
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
+def safe_llm_text(prompt, fallback: str = "") -> str:
+    try:
+        start_t = time.time()
+
+        if isinstance(prompt, str):
+            print(f"🔍 [LLM DEBUG] prompt type=str len={len(prompt)}")
+            prompt = [HumanMessage(content=prompt)]
+        else:
+            print(f"🔍 [LLM DEBUG] prompt type={type(prompt)}")
+
+        # Qwen3 thinking 모드 비활성화: <think> 블록이 토큰을 소진하는 문제 방지
+        if not isinstance(prompt[0], SystemMessage):
+            prompt = [SystemMessage(content="/no_think")] + list(prompt)
+
+        print("⏳ [LLM] invoke 시작")
+        response = llm.invoke(prompt)
+        print(f"⏳ [LLM] invoke 완료 ({time.time() - start_t:.2f}s)")
+
+        raw = getattr(response, "content", "")
+        # print(f"🔍 [LLM DEBUG] raw response={raw}")
+
+        if isinstance(raw, list):
+            raw = " ".join(
+                x.get("text", str(x)) if isinstance(x, dict) else str(x)
+                for x in raw
+            )
+
+        cleaned = clean_model_output(raw)
+        print(f"🔍 [LLM DEBUG] cleaned={cleaned}")
+
+        if not cleaned:
+            print("⚠️ [LLM] 빈 응답 감지")
+            return fallback
+
+        return cleaned
+
+    except Exception as e:
+        print(f"⚠️ [LLM] 호출 실패: {e}")
+        return fallback
+
+
+def extract_json_block(text: str) -> dict:
+    text = clean_model_output(text)
+
+    if not text:
+        return {}
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    if "```json" in text:
+        try:
+            inner = text.split("```json", 1)[1].split("```", 1)[0].strip()
+            return json.loads(inner)
+        except Exception:
+            pass
+
+    if "{" in text and "}" in text:
+        try:
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            return json.loads(text[start:end].strip())
+        except Exception:
+            pass
+
+    return {}
+
+
+def normalize_sentiment_label(text: str) -> str:
+    t = clean_model_output(text).strip().capitalize()
+
+    if t in ["Positive", "Negative", "Neutral"]:
+        return t
+
+    low = t.lower()
+    if "positive" in low:
+        return "Positive"
+    if "negative" in low:
+        return "Negative"
+    if "neutral" in low:
+        return "Neutral"
+
+    return "Neutral"
+
 
 # DB 연결 설정
 DB_CONFIG = {
@@ -129,15 +243,13 @@ except Exception as e:
     print(f"❌ [System] DB Pool 생성 실패: {e}")
     # raise SystemExit(1) # 로컬 테스트 시 DB 없으면 주석 처리 가능
 
-
 # 공통 안전 장치 (코드 값 유지)
 limits = [
-    (0, min, 740.0, "Deep OTM Call"),
-    (1, min, 737.5, "OTM Call"),
-    (2, max, 340.0, "Deep OTM Put"),
-    (3, max, 342.5, "OTM Put")
+    (0, min, 1025.0, "Deep OTM Call"),
+    (1, min, 1022.5, "OTM Call"),
+    (2, max, 375.0, "Deep OTM Put"),
+    (3, max, 377.5, "OTM Put")
 ]
-
 
 # [수정] 자산 5개로 확장 (옵션4 + 선물1)
 TARGET_ASSETS = [
@@ -147,7 +259,6 @@ TARGET_ASSETS = [
     {"name": "Put Hedge (Short)", "type": "Put"},  # 3
     {"name": "Mini Future (Delta)", "type": "Future"}  # 4  <-- NEW
 ]
-
 
 
 # ---------------------------------------------------------
@@ -205,8 +316,16 @@ def get_intraday_fraction():
 
 
 # get_expiry_days: 2026년 2월물
+today = datetime.now().date()
+year = today.year
+month = today.month
+days_left, expiry_date = get_expiry_days(year, month)
+if days_left == 0:
+    next_month = month + 1 if month < 12 else 1
+    next_year = year if month < 12 else year + 1
+    days_left, expiry_date = get_expiry_days(next_year, next_month)
 
-days_left, expiry_date = get_expiry_days(2026, 2)
+# days_left, expiry_date = get_expiry_days(2026, 4)
 
 # [적용] 현재 시간을 반영한 잔존일수 계산
 current_time_ratio = get_intraday_fraction()
@@ -216,7 +335,8 @@ days_to_expiry = float(days_left) + current_time_ratio
 print(f"🕒 [System Time] 현재 시간 비율: {current_time_ratio:.4f}")
 print(f"⏳ [Expiry Info] 남은 일수(DTE): {days_to_expiry:.4f} days")
 
-def fetch_latest_news_all(limit: int = 200):
+
+def fetch_latest_news_all(limit: int = 30):
     if db_pool is None:
         print("⚠️ [System] DB Pool 없음: 뉴스 조회 스킵")
         return []
@@ -229,7 +349,7 @@ def fetch_latest_news_all(limit: int = 200):
         query = """
                 SELECT date, time, title, body, category
                 FROM news_data
-               WHERE category IN ('거시경제_LLM','거시경제_KEY','','해외 증시_LLM','해외 증시_KEY','주도 섹터_LLM','주도 섹터_KEY')
+                WHERE category IN ('거시경제_LLM', '거시경제_KEY', '해외 증시_LLM', '해외 증시_KEY', '주도 섹터_LLM', '주도 섹터_KEY')
                 ORDER BY date DESC, time DESC
                     LIMIT %s;
                 """
@@ -247,7 +367,8 @@ def fetch_latest_news_all(limit: int = 200):
             pass
     return rows
 
-def fetch_latest_news(limit: int = 200):
+
+def fetch_latest_news(limit: int = 30):
     if db_pool is None:
         print("⚠️ [System] DB Pool 없음: 뉴스 조회 스킵")
         return []
@@ -280,12 +401,12 @@ def fetch_latest_news(limit: int = 200):
 
 
 # 1. 출력 스키마 정의 (Type Safety 확보)
-class JudgeOutput(BaseModel):
-    final_consensus: str = Field(description="상승/하락 의견을 종합한 최종 합의문 (한국어). [Divergence] 섹션을 반드시 포함해야 함.")
-    market_trend: Literal["Bullish", "Bearish", "Volatile", "Neutral"] = Field(description="최종 시장 방향성")
-    risk_score: float = Field(ge=1.0, le=10.0, description="리스크 점수 (1: 안전, 10: 매우 위험)")
-    news_sentiment: Literal["Positive", "Negative", "Neutral"] = Field(description="뉴스 데이터의 전반적 심리")
-    divergence_note: str = Field(description="뉴스 심리와 가격 액션 간의 괴리에 대한 기술적 요약")
+# class JudgeOutput(BaseModel):
+#     final_consensus: str = Field(description="상승/하락 의견을 종합한 최종 합의문 (한국어). [Divergence] 섹션을 반드시 포함해야 함.")
+#     market_trend: Literal["Bullish", "Bearish", "Volatile", "Neutral"] = Field(description="최종 시장 방향성")
+#     risk_score: float = Field(ge=1.0, le=10.0, description="리스크 점수 (1: 안전, 10: 매우 위험)")
+#     news_sentiment: Literal["Positive", "Negative", "Neutral"] = Field(description="뉴스 데이터의 전반적 심리")
+#     divergence_note: str = Field(description="뉴스 심리와 가격 액션 간의 괴리에 대한 기술적 요약")
 
 
 # --- [RAG 엔진 클래스: 3가지 핵심 기술 구현] ---
@@ -347,7 +468,13 @@ class FinancialRAGEngine:
             "최적화된 검색어 및 쿼리:"
         )
         chain = prompt | llm | StrOutputParser()
-        return chain.invoke({"context": market_context})
+        try:
+            result = chain.invoke({"context": market_context})
+            result = clean_model_output(result)
+            return result if result else market_context[:300]
+        except Exception as e:
+            print(f"⚠️ [RAG Rewrite] 쿼리 재작성 실패: {e}")
+            return market_context[:300]
 
     # ① 하이브리드 검색 (Hybrid Search)
     def hybrid_search(self, original_view: str, sql_news_list: List[Dict]) -> str:
@@ -376,7 +503,12 @@ class FinancialRAGEngine:
         return f"[유사 사례 및 지식]\n{vector_context}\n\n[실시간 관련 뉴스]\n{keyword_context}"
 
 
-rag_engine = FinancialRAGEngine()
+rag_engine = None
+try:
+    rag_engine = FinancialRAGEngine()
+except Exception as e:
+    print(f"⚠️ [RAG] 초기화 실패: {e}")
+    rag_engine = None
 
 
 # ---------------------------------------------------------
@@ -431,6 +563,18 @@ class DebateState(TypedDict, total=False):
     news_sentiment: str
     divergence_note: str
 
+    # self-improvement fields
+    eval_score: int
+    eval_critique: str
+    is_sufficient: bool
+    retry_count: int
+
+class EvalOutput(BaseModel):
+    score: int = Field(description="합의문의 논리적 완결성 및 뉴스 반영 점수 (1~10)")
+    is_sufficient: bool = Field(description="추가 개선 없이 채택 가능한가")
+    critique: str = Field(description="불충분하거나 보완이 필요한 부분에 대한 구체적 피드백")
+
+
 
 class ScenarioManager:
     def __init__(self, pool, embeddings_model):
@@ -480,7 +624,7 @@ class ScenarioManager:
 
     def find_nearest_scenario(self, view_text: str):
         """현재 뷰와 가장 유사한 시나리오 파라미터를 찾습니다."""
-        if not self.vectorstore:
+        if self.vectorstore is None:
             return None
 
         # 유사도 기반 상위 1개 추출
@@ -489,17 +633,13 @@ class ScenarioManager:
 
     def update_successful_scenario(self, view_text, mu, vol, corr, expected_ret, anchor_name):
         """수익률이 높은 파라미터를 지식 베이스에 추가/업데이트"""
-        if self.pool is None: return
+        if self.pool is None:
+            return
 
-        # 1. "Judge Consensus" 단어를 기준으로 자릅니다.
+        parts = view_text
         if "Judge Consensus" in view_text:
             parts = view_text.split("⚖️ [Judge Consensus]")[1].strip()
 
-            # 2. 만약 뒤에 붙은 [Divergence] 중복 섹션을 제외하고 싶다면 한 번 더 자를 수 있습니다.
-            # parts = parts.split("[Divergence]")[0].strip() + ' ' + \
-            #                  parts.split("[Divergence]")[1].strip().split("- NOTE")[0].strip()
-
-        # 1. 유사한 기존 시나리오가 있는지 확인 (중복 방지 및 업데이트)
         nearest = self.find_nearest_scenario(parts)
         if nearest:
             print("\nNearest scenario: \n")
@@ -509,25 +649,26 @@ class ScenarioManager:
         try:
             cursor = conn.cursor()
 
-            # 유사도가 매우 높은(거의 같은 상황) 시나리오가 있다면 업데이트, 없으면 신규 삽입
-            # 여기서는 단순화를 위해 '신규 삽입'을 기준으로 하며, 장세 설명을 요약하여 저장합니다.
-
             summary_query = (
                 "당신은 금융 요약기입니다. 아래의 긴 시장 뷰를 100자 이내의 핵심 상황 설명으로 요약하세요.\n"
                 f"내용: {view_text}"
             )
-            summary = llm.invoke(summary_query).content.strip()
+            # summary = safe_llm_text(summary_query, fallback="시장 시나리오 요약 실패")[:100]
+            summary = safe_llm_text(
+                [HumanMessage(content=summary_query)],
+                fallback="시장 시나리오 요약 실패"
+            )
 
             insert_sql = """
                          INSERT INTO macro_scenarios (scenario_name, market_description, mu, vol, corr, created_at)
                          VALUES (%s,
                                  %s,
-                                 CAST(%s AS DECIMAL(10, 4)), -- mu, decimal 4 digits  
-                                 CAST(%s AS DECIMAL(10, 4)), -- vol 
-                                 CAST(%s AS DECIMAL(10, 4)), -- corr 
-                                 now()) \
+                                 %s,
+                                 %s,
+                                 %s,
+                                 now())
                          """
-            # 수익률을 포함한 시나리오 명칭 생성
+
             scenario_name = f"Success_{anchor_name}_{datetime.now().strftime('%Y%m%d')}_{expected_ret:.1f}%"
 
             cursor.execute(insert_sql, (
@@ -540,7 +681,6 @@ class ScenarioManager:
             conn.commit()
             print(f"🌟 [Self-Learning] 고수익 시나리오 저장 완료: {scenario_name}\n")
 
-            # 저장 후 벡터 스토어 재로드 (최신화)
             self.load_and_index_scenarios()
 
         except Exception as e:
@@ -548,8 +688,10 @@ class ScenarioManager:
         finally:
             conn.close()
 
+
 # 전역 변수 선언
 scenario_manager = None
+
 
 # ---------------------------------------------------------
 # 3. 보조 함수들 (블랙숄즈, Greeks, API 호출 등 - 원본 유지)
@@ -616,24 +758,22 @@ def rag_engine_node(state: QuantState):
     """[RAG Node] 하이브리드 검색을 통해 지식 베이스 추출"""
     print("📡 [RAG Engine] 시장 상황/Manager View에 맞는 News 검색 중...")
 
+    if rag_engine is None:
+        print("⚠️ [RAG Engine] RAG 사용 불가 - 빈 컨텍스트로 진행")
+        return {"rag_context": ""}
+
     view = state.get('manager_view', '')
     raw_news = state.get('raw_news_data', [])
+    consensus_only = view
 
-
-    # 1. "Judge Consensus" 단어를 기준으로 자릅니다.
     if "Judge Consensus" in view:
         consensus_only = view.split("⚖️ [Judge Consensus]")[1].strip()
-
-        # 2. 만약 뒤에 붙은 [Divergence] 중복 섹션을 제외하고 싶다면 한 번 더 자를 수 있습니다.
-        # consensus_only = consensus_only.split("[Divergence]")[0].strip() + ' ' + consensus_only.split("[Divergence]")[1].strip().split("NOTE")[0].strip()
         consensus_only = consensus_only.split("- NOTE")[0].strip()
 
     print("\n[DEBUG] consensus_only: ")
     print(consensus_only)
 
-    # 하이브리드 검색 실행 (쿼리 재작성 포함)
     context = rag_engine.hybrid_search(consensus_only, raw_news)
-
     return {"rag_context": context}
 
 
@@ -643,32 +783,34 @@ def quant_engine(state: QuantState):
     rag_data = state.get('rag_context', '참고할 과거 데이터 없음')
 
     trend = state.get('market_trend', 'neutral').lower()
-    macro_ret = state.get('macro_pred', {}).get('pred_pct', 0.0)  # Macro 예측치 참조
+    macro_ret = state.get('macro_pred', {}).get('pred_pct', 0.0)
 
     iv = state['market_iv']
 
+    consensus_only = view
     if "Judge Consensus" in view:
         consensus_only = view.split("⚖️ [Judge Consensus]")[1].strip()
-
-        # 2. 뒤에 붙은 [Divergence] 중복 섹션, NOTE을 제외.
-        # consensus_only = consensus_only.split("[Divergence]")[0].strip() + ' ' + consensus_only.split("[Divergence]")[1].strip().split("NOTE")[0].strip()
 
     print("\n[DEBUG] consensus_only: ")
     print(consensus_only)
 
-    # [추가] DB 시나리오에서 유사 파라미터 검색
-    anchor = scenario_manager.find_nearest_scenario(consensus_only)
+    # anchor = scenario_manager.find_nearest_scenario(consensus_only)
+    anchor = scenario_manager.find_nearest_scenario(consensus_only) if scenario_manager else None
+
     anchor_info = ""
+    anchor_mu_text = "[0.03, -0.01, 0.02, -0.01, 0.01]"
+
+    anchor_name = "General_Market"
     if anchor:
-        state['anchor_name'] = anchor['name']
+        anchor_name = anchor.get('name', 'Scenario_Anchor')
+        anchor_mu_text = str(anchor.get('mu', anchor_mu_text))
         anchor_info = (
-            f"\n[과거 유사 시나리오 기준값: {anchor['name']}]\n"
-            f"- 기준 mu: {anchor['mu']}\n"
-            f"- 기준 vol: {anchor['vol']}\n"
-            f"- 기준 corr: {anchor['corr']}\n"
+            f"\n[과거 유사 시나리오 기준값: {anchor.get('name', 'Scenario_Anchor')}]\n"
+            f"- 기준 mu: {anchor.get('mu')}\n"
+            f"- 기준 vol: {anchor.get('vol')}\n"
+            f"- 기준 corr: {anchor.get('corr')}\n"
         )
     else:
-        state['anchor_name'] = "General_Market"  # 유사 시나리오가 없을 경우 기본값
         anchor_info = "\n[참조할 과거 시나리오 없음: 기본 파라미터 사용]\n"
 
     print(anchor_info)
@@ -677,17 +819,17 @@ def quant_engine(state: QuantState):
         "SYSTEM: You are a quantitative risk management engine. "
         "Output MUST be a strictly valid JSON object and NOTHING ELSE. "
         "No markdown, no headers, no conversational text.\n\n"
-        
-        # f"당신은 금융 분석 전문가입니다. 아래 [현재 상황]과 RAG로 추출된 [과거 유사 사례 및 지식]을 결합 분석하세요.\n"
+
         f"당신은 금융 분석 전문가입니다. 아래 [현재 상황]과 RAG로 추출된 [참고 Anchor]을 결합 분석하세요.\n"
         f"작성 규칙: 과거 시나리오(Anchor)를 기준으로 하되, 현재 IV와 뉴스 뉘앙스에 따라 mu, vol와 corr을 미세 조정(Fine-tune)하세요.\n"
         f"현재 상황: {consensus_only}\n\n"
+        f"참고 RAG 데이터: {rag_data}\n\n"
         f"DECISION TREND: {trend.upper()}\n"
         f"IV: {iv}%\n\n"
         f"[참고 Anchor]: {anchor_info}\n\n"
         f"CRITICAL RULE: Your 'mu' and 'vol' MUST be centered around the provided [참고 Anchor] values.\n"
         f"Macro Predictor says {macro_ret}%. If this contradicts the sentiment, favor the Macro Predictor's direction for the 'mu' vector.\n"
-        f"Anchor mu was: {anchor['mu']}. Adjust it by no more than 20% based on current IV."
+        f"Anchor mu was: {anchor_mu_text}. Adjust it by no more than 20% based on current IV.\n"
         f"Analyze the market view and estimate parameters for 5 Assets.\n"
         f"Assets: [Call_Long, Call_Short, Put_Long, Put_Short, Mini_Future]\n"
         f"1. Deep OTM Call Long (Bull/Convexity)\n"
@@ -700,42 +842,26 @@ def quant_engine(state: QuantState):
         "1. 'Price Action' takes precedence over news sentiment.\n"
         "2. If price is rising despite negative news, it is a 'Bullish Climber'.\n"
         "3. For 'Bullish Climber', give bonus mu to Long assets.\n\n"
-
         "ASSET LIST (Indices 0-4):\n"
         "0: Deep OTM Call Long, 1: OTM Call Short, 2: Deep OTM Put Long, 3: OTM Put Short, 4: Mini KOSPI200 Future\n\n"
-
         "REQUIRED OUTPUT FORMAT (JSON ONLY):\n"
         "{\n"
         "  \"mu\": [float, float, float, float, float],\n"
         "  \"vol\": [0.2, 0.2, 0.3, 0.3, 0.15],\n"
         "  \"corr\": [[5x5 matrix of floats]]\n"
-        "}\n\n"
-
-        "ASSISTANT: {"  # JSON의 시작을 유도
+        "}\n"
     )
 
     print(prompt)
 
     try:
-        raw_response = llm.invoke(prompt).content
-        print(f"DEBUG [LLM Response]:\n{raw_response}")  # <-- 이 줄을 추가해서 확인하세요.
+        # raw_response = safe_llm_text(prompt, fallback="")
+        raw_response = safe_llm_text([HumanMessage(content=prompt)], fallback="")
+        print(f"DEBUG [LLM Response]:\n{raw_response}")
 
-        # JSON 추출 로직 개선
-        json_str = ""
-        if "```json" in raw_response:
-            json_str = raw_response.split("```json")[1].split("```")[0].strip()
-        elif "{" in raw_response:
-            # 코드 블록이 없어도 { } 중괄호 사이의 내용을 추출
-            start = raw_response.find("{")
-            end = raw_response.rfind("}") + 1
-            json_str = raw_response[start:end].strip()
-        else:
-            json_str = raw_response.strip()
-
-        data = json.loads(json_str)
-
-
-        # (이후 원본 코드의 행렬 처리 로직 동일하게 수행)
+        data = extract_json_block(raw_response)
+        if not data:
+            raise ValueError("LLM JSON 파싱 실패")
 
         mu = list(data.get('mu', []))
         vol = list(data.get('vol', []))
@@ -762,49 +888,118 @@ def quant_engine(state: QuantState):
             for j in range(target_n):
                 sigma[i][j] = corr[i][j] * vol[i] * vol[j]
 
-        return {"expected_returns": mu, "vol_vector": vol, "covariance_matrix": sigma.tolist(), "correlation_matrix": corr.tolist()}
+        return {
+            "expected_returns": mu,
+            "vol_vector": vol,
+            "covariance_matrix": sigma.tolist(),
+            "correlation_matrix": corr.tolist(),
+            "anchor_name": anchor_name
+        }
 
     except Exception as e:
         print(f"⚠️ [QuantEngine] Error: {e}")
         n = 5
-        return {"expected_returns": [0.01] * n, "covariance_matrix": (np.eye(n) * 0.04).tolist()}
+        return {
+            "expected_returns": [0.01] * n,
+            "vol_vector": [0.15] * n,
+            "covariance_matrix": (np.eye(n) * 0.04).tolist(),
+            "correlation_matrix": np.eye(n).tolist(),
+            "anchor_name": anchor_name
+        }
 
 
 # (중략: market_data_fetcher, portfolio_optimizer, reporter, notifier 등 원본 노드 유지)
 # ... [원본 코드의 노드들 모두 포함됨] ...
 
+def compute_dynamic_risk_score(
+    llm_score: float,
+    macro_pred: dict,
+    news_sentiment: str,
+    is_price_rising: bool,
+    market_trend: str,
+    divergence_note: str,
+    market_iv: float = 0.0,
+) -> float:
+    """
+    LLM 베이스 점수에 실제 시장 데이터를 결합한 동적 리스크 점수 계산.
+    결과: 1.0 ~ 10.0 클램핑 후 반환.
+    """
+    score = llm_score
+
+    # 1. 매크로 예측 pred_pct (하락 전망일수록 최대 +2.5)
+    pred_pct = float(macro_pred.get("pred_pct", 0.0))
+    if pred_pct < 0:
+        score += min(2.5, abs(pred_pct) * 0.5)
+
+    # 2. 방향성 정확도 (불확실성 높을수록 최대 +1.5)
+    dir_acc = float(macro_pred.get("directional_acc", 1.0))
+    score += max(0.0, (1.0 - dir_acc) * 1.5)
+
+    # 3. 뉴스 센티먼트
+    sentiment = str(news_sentiment).strip().capitalize()
+    if sentiment == "Negative":
+        score += 1.5
+    elif sentiment == "Positive":
+        score -= 0.8
+
+    # 4. 가격 방향
+    if not is_price_rising:
+        score += 0.6
+    else:
+        score -= 0.4
+
+    # 5. 시장 트렌드
+    trend = str(market_trend).strip().lower()
+    if trend == "bearish":
+        score += 1.2
+    elif trend == "volatile":
+        score += 0.6
+    elif trend == "bullish":
+        score -= 0.6
+
+    # 6. 다이버전스 감지
+    div = str(divergence_note).lower()
+    if "divergence" in div or "괴리" in div:
+        score += 0.5
+
+    # 7. VKOSPI/IV (옵션)
+    if market_iv >= 30:
+        score += 2.0
+    elif market_iv >= 25:
+        score += 1.2
+    elif market_iv >= 20:
+        score += 0.6
+
+    result = round(max(1.0, min(10.0, score)), 2)
+    print(f"🎯 [DynamicRisk] LLM={llm_score:.1f} -> Dynamic={result:.2f} "
+          f"(pred={pred_pct:+.2f}%, iv={market_iv:.1f}, trend={trend}, sentiment={sentiment})")
+    return result
+
+
 def divergence_checker_node(state: QuantState) -> Dict[str, Any]:
-    """
-    뉴스(심리)와 가격(추세)의 괴리를 판단하여 market_trend를 교정하는 노드
-    - [개선] Debate에서 계산한 news_sentiment / divergence_note를 우선 재활용
-    - price action은 외부 연동 전까지 is_price_rising 플래그를 state로 주입받아 사용
-    """
     macro_val = state.get('macro_pred', {}).get('pred_pct', 0.0)
 
-    # [수정] 매크로 예측치가 확실한 음수라면, 뉴스가 아무리 좋아도 Bullish로 보지 않음
-    if macro_val < -0.5:  # -0.5% 이하 강력한 하락 예고 시
+    if macro_val < -0.5:
         new_trend = "bearish"
         correction_note = f"\n⚠️ [Macro Override] 매크로 예측치({macro_val}%)가 심각한 하락을 예고함. 뷰를 BEARISH로 전환."
         return {
             "market_trend": new_trend,
             "manager_view": state['manager_view'] + correction_note,
-            "risk_aversion": state['risk_aversion'] + 1.0  # 리스크 회피도 강화
+            "risk_aversion": min(10.0, state['risk_aversion'] + 1.0)
         }
-
 
     manager_view = state['manager_view']
     current_trend = state.get('market_trend', 'neutral').lower()
 
-    # 1) 뉴스 심리: Debate 재활용 우선
     news_sentiment = state.get("news_sentiment", "").strip().capitalize()
     if news_sentiment not in ["Positive", "Negative", "Neutral"]:
         sentiment_prompt = (
             f"Analyze the sentiment of the following market view: \"{manager_view}\"\n"
             f"Classification: Return ONLY one word from ['Positive', 'Negative', 'Neutral']."
         )
-        news_sentiment = llm.invoke(sentiment_prompt).content.strip().capitalize()
-
-    # 2) 가격 액션: state 플래그 우선
+        news_sentiment = normalize_sentiment_label(
+            safe_llm_text([HumanMessage(content=sentiment_prompt)], fallback="Neutral")
+        )
 
     is_price_rising = bool(state.get("is_price_rising", True))
 
@@ -815,18 +1010,8 @@ def divergence_checker_node(state: QuantState) -> Dict[str, Any]:
         new_trend = "bullish"
         correction_note = "\n⚠️ [Divergence Alert] 뉴스는 부정적이나 시장의 회복력이 강력함. '상승 추세'로 강제 전환."
 
-    # [수정] Divergence 판단 로직 완화
-    # 가격이 '확실히 하락세'가 아니라면, 긍정 뉴스에 대해 관망(Neutral)이나 기존 유지로 처리
-
-    # (기존)
-    # elif news_sentiment == "Positive" and not is_price_rising:
-    #     new_trend = "bearish"
-
-    # (수정)
     elif news_sentiment == "Positive" and not is_price_rising:
-        # 가격이 단순히 보합인 경우(예: 예측치가 아주 미미한 음수거나 0 근처)에는 Bearish로 꺾지 않음
-        # 확실한 괴리일 때만 경고
-        new_trend = "neutral"  # 혹은 "bearish" 대신 "neutral"로 톤 다운
+        new_trend = "neutral"
         correction_note = "\n⚠️ [Divergence Alert] 호재에도 가격 반응 미약. 추세 판단 '중립/관망'으로 유보."
 
     if correction_note:
@@ -834,11 +1019,11 @@ def divergence_checker_node(state: QuantState) -> Dict[str, Any]:
         return {
             "market_trend": new_trend,
             "manager_view": manager_view + correction_note,
-            "risk_aversion": max(2.0, state['risk_aversion'] - 1.5) if new_trend == "bullish" else state[
-                'risk_aversion']
+            "risk_aversion": max(2.0, state['risk_aversion'] - 1.5) if new_trend == "bullish" else state['risk_aversion']
         }
 
     return {"market_trend": current_trend}
+
 
 
 # ---------------------------------------------------------
@@ -870,6 +1055,7 @@ def get_iv_curve(atm_iv: float, strikes: List[float], atm_price: float) -> dict:
         iv_map[k] = max(0.01, adjusted_iv)
 
     return iv_map
+
 
 # ---------------------------------------------------------
 # [Modified] Skew Aware Black-Scholes Calculator
@@ -1048,13 +1234,14 @@ def futures_strategy_engine(state: QuantState):
     return {"futures_signal": signal}
 
 
-# 코드 기준: 2월물 코드(B0562/C0562)
+# 코드 기준: 4월물 코드
 def _generate_option_code(strike: float, asset_type: str) -> str:
     k_int = int(strike)
     if asset_type.lower() == "call":
-        return f"B0562{k_int}"
+        return f"B0564{k_int}"
     else:
-        return f"C0562{k_int}"
+        return f"C0564{k_int}"
+
 
 def fetch_option_data_from_api(focode: str):
     body = {"t2101InBlock": {"focode": focode}}
@@ -1075,6 +1262,7 @@ def fetch_option_data_from_api(focode: str):
         return DUMMY_DATA
     except Exception:
         return DUMMY_DATA
+
 
 def fetch_mini_future_data_from_api(focode: str, fallback_price: float) -> Dict[str, float]:
     """
@@ -1102,6 +1290,7 @@ def fetch_mini_future_data_from_api(focode: str, fallback_price: float) -> Dict[
         print(f"⚠️ [API] MINI KOSPI 200 조회 실패 ({e}). 지수({fallback_price})로 폴백합니다.")
         return DUMMY
 
+
 def market_data_fetcher(state: QuantState):
     kospi = state['kospi_index']
     iv = state['market_iv'] / 100.0  # % -> 소수
@@ -1122,6 +1311,7 @@ def market_data_fetcher(state: QuantState):
         print("-" * 30)
     else:
         print(rate)
+        rate = "2.75"  # CD금리 조회 실패 시 기본값
 
     risk_free_rate = float(rate) / 100.0  # CD 91일물 금리
 
@@ -1147,7 +1337,6 @@ def market_data_fetcher(state: QuantState):
         focode = _generate_option_code(strike, asset_type)
         codes.append(focode)
 
-        api_data = fetch_option_data_from_api(focode)
         api_data = fetch_option_data_from_api(focode)
 
         mult = -1.0 if "Short" in TARGET_ASSETS[i]['name'] else 1.0
@@ -1228,34 +1417,24 @@ def market_data_fetcher(state: QuantState):
     return {"strikes": strikes, "asset_codes": codes, "market_data": final_data}
 
 
-def _fallback_weights(market_trend: str) -> List[float]:
+def _fallback_portfolio_weights(market_trend: str) -> List[float]:
     t = str(market_trend).lower()
     if t == "bullish":
-        # (앞서 튜닝한 Bullish 값 유지)
         return [0.18, 0.15, 0.05, 0.15, 0.17, 0.30]
     elif t == "bearish":
-        # 수정: Put Long을 0.20 -> 0.18로, Put Short를 0.10 -> 0.12로 미세 조정
-        # 계산: (0.05 + 0.18) - (0.20 + 0.12) * 0.4 = 0.23 - 0.128 = 0.102 (10.2%)
-        # 결과: MAX_DEBIT_RATIO(15%) 대비 약 4.8%p의 탐색 공간 확보
         return [0.05, 0.20, 0.18, 0.12, 0.15, 0.30]
     elif t == "volatile":
         return [0.20, 0.10, 0.20, 0.10, 0.10, 0.30]
     else:
         return [0.10, 0.20, 0.10, 0.20, 0.10, 0.30]
 
-
 def _get_objective_weights(market_trend: str, risk_aversion: float) -> Dict[str, float]:
-    """
-    [튜닝 목표]
-    - '수익 대박'보다 '비용 절감(Theta)' + '리스크 관리' 우선
-    - risk_aversion 반영을 강화(리스크 회피 성향이 강할수록 방어적으로)
-    """
     weights = {
-        "return": 1.0,                    # 기존 2.0 -> 1.0
-        "risk": risk_aversion * 2.0,      # 리스크 회피 반영 강화
+        "return": 1.0,
+        "risk": risk_aversion * 2.0,
         "delta": 15.0,
         "vega": 2.0,
-        "theta": 5.0,                     # 기존 1.0 -> 5.0
+        "theta": 5.0,
         "gamma": 2.0,
         "concentration_penalty": 10.0,
         "direction_penalty": 15.0
@@ -1264,20 +1443,17 @@ def _get_objective_weights(market_trend: str, risk_aversion: float) -> Dict[str,
     trend = str(market_trend).lower()
 
     if trend == "bullish":
-        # 상승장이어도 '델타 추격 + 비싼 롱'이 아니라, 비용/리스크 균형
         weights["return"] = 1.5
         weights["delta"] = 50.0
         weights["risk"] = risk_aversion * 1.2
 
     elif trend == "bearish":
-        # 하락장에서는 리스크(꼬리) 관리 중요
         weights["return"] = 1.0
         weights["delta"] = 25.0
         weights["theta"] = 6.0
         weights["risk"] = risk_aversion * 2.2
 
     elif trend == "volatile":
-        # 변동성 장: vega/gamma도 의미 있으나, 여전히 비용 폭주 방지 위해 theta도 유지
         weights["return"] = 1.0
         weights["vega"] = 4.0
         weights["gamma"] = 3.0
@@ -1286,7 +1462,6 @@ def _get_objective_weights(market_trend: str, risk_aversion: float) -> Dict[str,
         weights["risk"] = risk_aversion * 2.0
 
     else:
-        # neutral/reversal: theta 중심(박스 수익) + 리스크 관리
         weights["return"] = 1.0
         weights["theta"] = 6.0
         weights["delta"] = 10.0
@@ -1314,19 +1489,17 @@ def get_dynamic_risk_targets(state: QuantState):
     dte = state.get('days_to_expiry', 4.0)
     trend = str(state.get('market_trend', 'neutral')).lower()
 
-    target_delta = 0.0
-    target_vega = 0.0
     vega_scale = np.sqrt(dte / 5.0)
     gamma_limit = 0.05 * (dte / 4.0)
 
     if trend == "bullish":
-        target_delta, target_vega = 0.20, 0.05 * vega_scale
+        target_delta, target_vega = 2.35, 0.05 * vega_scale
     elif trend == "bearish":
-        target_delta, target_vega = -0.20, 0.08 * vega_scale
+        target_delta, target_vega = -3.50, 0.15 * vega_scale
     elif trend == "volatile":
-        target_delta, target_vega = -0.05, 0.40 * vega_scale
+        target_delta, target_vega = -0.10, 0.40 * vega_scale
     else:
-        target_delta, target_vega = 0.05, -0.10 * vega_scale
+        target_delta, target_vega = 0.15, -0.10 * vega_scale
 
     return {
         "target_delta": target_delta,
@@ -1363,30 +1536,30 @@ def portfolio_optimizer_greeks_mo(state: QuantState):
 
     # [튜닝] 최대 허용 Debit 비율 축소: 12% -> 3%
     # 봇이 "돈을 많이 내는 포트폴리오"를 구조적으로 못 만들게 강제
-    MAX_DEBIT_RATIO = 0.25
+    # MAX_DEBIT_RATIO = 0.85 if trend == "bearish" else 0.50
+    MAX_DEBIT_RATIO = 0.50
 
-    FUTURE_MAX_WEIGHT = 0.30
+    # local_min_cash = 0.10 if trend == "bearish" else MIN_CASH
+    local_min_cash = 0.15 if trend == "bearish" else MIN_CASH
+
+    # [수정] volatile에서는 선물 방향 노출을 더 엄격히 제한
+    FUTURE_MAX_WEIGHT = 0.10 if trend == "volatile" else 0.30
     base_cash = 0.30 if "불확실" in state.get('manager_view', '') else MIN_CASH
 
     if trend == "bullish":
-        # target_delta, target_vega = 1.30, 0.05
         hedge_indices = [1, 2]
     elif trend == "bearish":
-        # target_delta, target_vega = -1.30, 0.08
         hedge_indices = [0, 3]
     elif trend == "volatile":
-        # target_delta, target_vega = -0.40, 0.40
         hedge_indices = [1, 3]
     else:
-        # target_delta, target_vega = 0.30, -0.15
         hedge_indices = [0, 2]
 
     obj_weights = _get_objective_weights(trend, risk_aversion)
     expiry_effects = get_expiration_effects(state)
-    # risk_params = get_dynamic_risk_targets(state)
     dte = state.get('days_to_expiry', 3.0)
 
-    put_short_limit = 0.20 if ((trend == "bearish" and risk_aversion >= 6.0) or trend == "volatile") else MAX_WEIGHT
+    put_short_limit = MAX_WEIGHT  # spread 제약으로 naked put 차단 (bearish/volatile 공통)
 
     def multi_objective_cost(w, iv_val):
         """
@@ -1425,11 +1598,12 @@ def portfolio_optimizer_greeks_mo(state: QuantState):
         if dist_to_limit < 0.001:
             # 지수 성벽(Exponential Wall)의 강도를 1e4로 낮추고
             # abs(dist_to_limit)에 따른 선형 증가를 결합해 엔진이 '탈출' 방향을 찾게 함
-            f_debit_penalty = 1e4 * (1.0 + abs(dist_to_limit) * 500.0)
+            penalty_coef = 1e3 if trend == "bearish" else 1e4
+            f_debit_penalty = penalty_coef * (1.0 + abs(dist_to_limit) * 100.0)
         else:
             # 로그 장벽(Log Barrier)의 계수를 100.0으로 설정하여
             # 한도에 가까워질수록 '부드러운 압박'을 가함
-            f_debit_penalty = -np.log(max(dist_to_limit, 1e-6)) * 100.0
+            f_debit_penalty = -np.log(max(dist_to_limit, 1e-6)) * 50.0
 
         # ---------------------------------------------------------
         # [3] 스프레드 구조적 균형 (Spread Balance)
@@ -1450,10 +1624,10 @@ def portfolio_optimizer_greeks_mo(state: QuantState):
         # 4-1. 리스크 대비 수익 (Sharpe 스타일)
         f_return = -port_return / (port_vol + 0.1)
 
-        # 4-2. 비용 연동형 동적 델타 가중치
-        # 자본(Debit)이 부족해질수록 델타 타겟을 맞추는 것보다 비용 절감이 우선됨
-        effective_delta_weight = 20.0 / (1.0 + (max(0, est_net_debit) / MAX_DEBIT_RATIO))
-        f_delta = ((curr_delta - target_delta) / 1.0) ** 2 * 100.0
+        # [수정] obj_weights["delta"]를 실제로 사용 (V16_3 로직 복원)
+        # bearish/volatile에서는 1.5배 강화하여 delta 중립 유도
+        effective_delta_weight = (obj_weights["delta"] * 1.5) if trend in ["bearish", "volatile"] else obj_weights["delta"]
+        f_delta = ((curr_delta - target_delta) / 1.0) ** 2 * 500.0
 
         # 4-3. 베가 및 세타 (추세 조건부 가중치)
         f_vega = ((curr_vega - risk_params['target_vega']) / max(iv_val / 100.0, 0.1)) ** 2
@@ -1464,6 +1638,10 @@ def portfolio_optimizer_greeks_mo(state: QuantState):
         gamma_penalty_weight = 150.0 / (dte + 0.05)
         f_gamma_risk = (max(0, abs(curr_gamma) - risk_params['gamma_limit'])) ** 2 * gamma_penalty_weight
 
+        if trend == "volatile" and curr_gamma < 0:
+            # [수정] 변동성 장에서 음의 감마는 추가 벌점
+            f_gamma_risk += (abs(curr_gamma) ** 2) * 4000.0
+
         # ---------------------------------------------------------
         # [5] 방향성 가드레일 (IV-Adaptive Dynamic Threshold)
         # ---------------------------------------------------------
@@ -1471,10 +1649,17 @@ def portfolio_optimizer_greeks_mo(state: QuantState):
         dynamic_lambda = 1000.0 / iv_factor
         f_direction_penalty = 0.0
 
-        if trend == "bullish" and curr_delta < dynamic_threshold:
-            f_direction_penalty = (dynamic_threshold - curr_delta) ** 2 * dynamic_lambda
-        elif trend == "bearish" and curr_delta > -dynamic_threshold:
-            f_direction_penalty = (curr_delta + dynamic_threshold) ** 2 * dynamic_lambda
+        if trend == "bullish":
+            if curr_delta < 0:
+                f_direction_penalty = (abs(curr_delta) + 0.5) ** 2 * 50000.0
+            elif curr_delta < 0.1:
+                f_direction_penalty = (0.1 - curr_delta) ** 2 * 5000.0
+
+        elif trend == "bearish":
+            if curr_delta > 0:
+                f_direction_penalty = (curr_delta + 0.5) ** 2 * 50000.0
+            elif curr_delta > -0.1:
+                f_direction_penalty = (curr_delta + 0.1) ** 2 * 5000.0
 
         # ---------------------------------------------------------
         # [6] 기타 구조적 페널티 및 특수 모드
@@ -1511,14 +1696,17 @@ def portfolio_optimizer_greeks_mo(state: QuantState):
         if i == 0:
             bounds.append((0.0, INSURANCE_LIMIT if trend == "bearish" else MAX_WEIGHT))
         elif i == 1:
-            bounds.append((0.0, MAX_WEIGHT))
+            # [수정] volatile에서는 Call Short 상한 축소
+            bounds.append((0.0, 0.15 if trend == "volatile" else MAX_WEIGHT))
         elif i == 2:
-            bounds.append((0.0, INSURANCE_LIMIT if trend == "bullish" else MAX_WEIGHT))
+            put_long_min = 0.10 if trend in ("bearish", "volatile") else 0.0
+            bounds.append((put_long_min, 0.65 if trend == "bearish" else MAX_WEIGHT))
         elif i == 3:
             bounds.append((0.0, put_short_limit))
 
     bounds.append((-FUTURE_MAX_WEIGHT, +FUTURE_MAX_WEIGHT))
-    bounds.append((MIN_CASH, 1.0))  # cash
+    # bounds.append((MIN_CASH, 1.0))  # cash
+    bounds.append((local_min_cash, 1.0))  # cash
 
     constraints = [
         {'type': 'eq', 'fun': lambda x: np.sum(x) - 1.0},
@@ -1527,10 +1715,12 @@ def portfolio_optimizer_greeks_mo(state: QuantState):
     ]
 
     if trend == "bullish":
-        constraints.append({'type': 'ineq', 'fun': lambda x: 0.40 - np.sum([x[1],x[2]])})
+        constraints.append({'type': 'ineq', 'fun': lambda x: 0.40 - np.sum([x[1], x[2]])})
+    if trend in ("bearish", "volatile"):
+        # Put Spread 강제: Put Long >= Put Short (naked put 차단)
+        constraints.append({'type': 'ineq', 'fun': lambda x: x[2] - x[3]})
 
-
-    init_w = np.array(_fallback_weights(trend))
+    init_w = np.array(_fallback_portfolio_weights(trend))
     for i, (l, h) in enumerate(bounds):
         init_w[i] = np.clip(init_w[i], l, h)
     init_w[-1] = 1.0 - np.sum(init_w[:-1])
@@ -1543,7 +1733,7 @@ def portfolio_optimizer_greeks_mo(state: QuantState):
         res = minimize(
             multi_objective_cost,
             init_w,
-            args=(current_iv,), # <--- 스코프 에러 해결의 핵심
+            args=(current_iv,),
             method='SLSQP',
             bounds=bounds,
             constraints=constraints,
@@ -1557,7 +1747,9 @@ def portfolio_optimizer_greeks_mo(state: QuantState):
         print(f"❌ Optimization Error: {e}")
 
     print("❌ Using Fallback Weights.")
-    return {"optimal_weights": _fallback_weights(trend), "hedge_indices": hedge_indices}
+    return {"optimal_weights": _fallback_portfolio_weights(trend), "hedge_indices": hedge_indices}
+
+
 
 def calculate_refined_futures_qty(state: QuantState, opt_delta: float, opt_gamma: float) -> int:
     kospi = state['kospi_index']
@@ -1573,24 +1765,23 @@ def calculate_refined_futures_qty(state: QuantState, opt_delta: float, opt_gamma
     expected_move = kospi * daily_vol
     adjusted_delta = opt_delta + (opt_gamma * expected_move)
 
-    # trend = str(state['market_trend']).lower()
-    # target_delta = 0.0
-    # if trend == "bullish":
-    #     target_delta = 0.15
-    # elif trend == "bearish":
-    #     target_delta = -0.15
-
     delta_gap = target_delta - adjusted_delta
-    required_exposure = delta_gap * capital
-    future_notional = kospi * MULTIPLIER  # 미니선물 1계약 명목금액
 
-    min_hedge_threshold = (capital * 0.005) / (kospi * MULTIPLIER)
+    # [수정] 기존 capital/notional 방식은 단위가 섞여 선물 수량이 과도해질 수 있음
+    # [수정] 계약 델타 기준으로 직접 보정
+    min_hedge_threshold = 0.25 if str(state.get('market_trend', '')).lower() == "volatile" else 0.15
 
     if abs(delta_gap) < min_hedge_threshold:
         print(f"     ℹ️ [Hedge Skip] Gap({delta_gap:.3f}) < Threshold({min_hedge_threshold:.3f})")
         return 0
 
-    return int(round(required_exposure / future_notional))  # int(round(delta_gap / 1.0))
+    fut_qty = int(round(delta_gap))
+
+    # [수정] volatile에서는 과도한 선물 방향 노출 방지
+    if str(state.get('market_trend', '')).lower() == "volatile":
+        fut_qty = int(np.clip(fut_qty, -2, 2))
+
+    return fut_qty
 
 
 def find_beps(positions, current_kospi):
@@ -1599,7 +1790,7 @@ def find_beps(positions, current_kospi):
     Future까지 포함 가능하도록 확장.
     """
     beps = []
-    scan_range = np.arange(current_kospi * 0.9, current_kospi * 1.1, 0.1)
+    scan_range = np.arange(current_kospi * 0.8, current_kospi * 1.2, 0.1)
 
     prev_pnl = None
     for s in scan_range:
@@ -1649,6 +1840,7 @@ def get_risk_management_params(state: QuantState):
     sl = sl * (1.0 - (risk_score - 5.0) * 0.05)
     return tp, sl
 
+
 def _html_escape(s):
     if s is None:
         return ""
@@ -1671,7 +1863,7 @@ def execution_reporter_greeks(state: QuantState):
     macro_pred = state.get("macro_pred", {}) or {}
 
     if not weights or not strikes or not market_data:
-        return {"final_report": "Optimization Failed: Missing Market Data"}
+        return {"final_report": "Optimization Failed: Missing Market Data", "console_report": "Optimization Failed: Missing Market Data"}
 
     w_options = weights[:4]
     w_future_weight = weights[4]
@@ -1685,7 +1877,6 @@ def execution_reporter_greeks(state: QuantState):
     def get_unit_cost(strike, price, is_short):
         return get_naked_margin(strike, price) if is_short else price * MULTIPLIER
 
-
     for i, func, limit_val, name in limits:
         if i < len(strikes):
             strikes[i] = func(strikes[i], limit_val)
@@ -1695,7 +1886,6 @@ def execution_reporter_greeks(state: QuantState):
     direction += mapping.get(trend, " ⚖️")
 
     # STEP 1: 옵션 기본 수량 산출
-
     # [ISSUE 해결 3] 헤지 포지션의 이산화 손실 방지 (Floor Logic)
     for i, w in enumerate(w_options):
         asset = TARGET_ASSETS[i]
@@ -1707,13 +1897,14 @@ def execution_reporter_greeks(state: QuantState):
         # 기본 수량 (버림 처리)
         raw_qty = int((capital * w) // u_cost) if price > 0 and u_cost > 0 else 0
 
-        # [Hedge Protection] 비중이 0.2% 이상인데 수량이 0이면 최소 1계약 할당
-        if i in hedge_indices and w > 0.002 and raw_qty == 0:
+        # [Guardrail] 비중이 0.2% 이상인데 수량이 0이면 최소 1계약 할당 (hedge/main 모두)
+        if w > 0.002 and raw_qty == 0:
             raw_qty = 1
-            print(f"   🛡️ [Guardrail] {asset['name']} 최소 1계약 강제 할당 (Weight: {w:.1%})")
+            role_tag = "🛡️ Hedge" if i in hedge_indices else "🚀 Main"
+            print(f"   [{role_tag} Guardrail] {asset['name']} 최소 1계약 강제 할당 (Weight: {w:.1%})")
 
         temp_positions.append({
-            "idx": i, "name": asset['name'], "type": asset['type'], # [FIX] missing 'type' key added
+            "idx": i, "name": asset['name'], "type": asset['type'],  # [FIX] missing 'type' key added
             "pos_type": "Short" if is_short else "Long",
             "strike": strike, "price": price,
             "unit_margin_naked": get_naked_margin(strike, price),
@@ -1731,10 +1922,10 @@ def execution_reporter_greeks(state: QuantState):
         #     sp['qty'] = lp['qty']
         if lp['qty'] > 0 and sp['qty'] == 0:
             sp['qty'] = max(1, int(lp['qty'] * 0.5))
-
+        if sp['qty'] > 0 and lp['qty'] == 0:
+            lp['qty'] = 1
 
     # STEP 2: 선물 헤지 수량
-
     opt_delta_for_hedge = sum(p['qty'] * p['delta_unit'] for p in temp_positions)
     opt_gamma_for_hedge = sum(p['qty'] * p['gamma_unit'] for p in temp_positions)
 
@@ -1745,7 +1936,6 @@ def execution_reporter_greeks(state: QuantState):
     fut_qty_signed = int(np.clip(fut_qty_signed, -max_fut_contracts, +max_fut_contracts))
 
     # STEP 3: 증거금 체크 및 스케일링
-
     def get_total_margin_locked(t_pos, f_qty):
         m_locked = 0.0
         for l_idx, s_idx in pairs:
@@ -1777,7 +1967,6 @@ def execution_reporter_greeks(state: QuantState):
         final_margin_locked = initial_total_margin
 
     # STEP 4: 포지션 확정
-
     positions = []
     total_spent_on_assets, total_premium_received, total_premium_paid = 0.0, 0.0, 0.0
     hedge_assets_list = []
@@ -1833,13 +2022,28 @@ def execution_reporter_greeks(state: QuantState):
             "amount": 0.0, "role": "🛡️ Hedge"
         })
 
+    # [수정] Directional Bias Alert 추가
+    net_delta_notional = total_port_greeks['delta'] * kospi * MULTIPLIER
+    delta_capital_ratio = (abs(net_delta_notional) / capital) if capital > 0 else 0.0
+
+    DELTA_ALERT_CONTRACTS = 2.0
+    DELTA_ALERT_CAPITAL_RATIO = 0.30
+
+    if abs(total_port_greeks['delta']) >= DELTA_ALERT_CONTRACTS or delta_capital_ratio >= DELTA_ALERT_CAPITAL_RATIO:
+        bias_side = "LONG DELTA BIAS" if total_port_greeks['delta'] > 0 else "SHORT DELTA BIAS"
+        print(
+            f"⚠️ [Directional Bias Alert] {bias_side} | "
+            f"Delta={total_port_greeks['delta']:.2f} | "
+            f"Notional={int(net_delta_notional):+,} KRW | "
+            f"CapitalRatio={delta_capital_ratio * 100:.1f}%"
+        )
+
     def calculate_expiry_pnl(target_s):
         total_pnl = 0.0
         for p in positions:
             if p.get('option_type') == "Future":
                 unit_pnl = (target_s - p['price']) * MULTIPLIER if p['type'] == "Long" else (p[
                                                                                                  'price'] - target_s) * MULTIPLIER
-
             else:
                 ev = max(0, target_s - p['strike']) if p['option_type'] == "Call" else max(0, p['strike'] - target_s)
                 unit_pnl = (ev - p['price']) * MULTIPLIER if p['type'] == "Long" else (p['price'] - ev) * MULTIPLIER
@@ -2191,13 +2395,16 @@ def execution_reporter_greeks(state: QuantState):
 
     # ----- Strategy Analysis card -----
     delta_pnl_1pct = total_port_greeks['delta'] * (kospi * 0.01) * MULTIPLIER
-    final_leverage = abs(total_port_greeks['delta'] * kospi * MULTIPLIER) / capital if capital > 0 else 0.0
+    final_leverage = abs(net_delta_notional) / capital if capital > 0 else 0.0
+    delta_capital_pct = (net_delta_notional / capital) * 100 if capital > 0 else 0.0
 
     report += '<div class="card"><div class="card-h">🎯 [Strategy Analysis]</div><div class="card-b">'
     report += "<div class='kv'>"
     report += _kv_row("• Direction", _html_escape(direction))
     report += _kv_row("• Portfolio Delta",
                       f'{total_port_greeks["delta"]:.2f} <span class="pill">Leverage: {final_leverage:.1f}x</span>')
+    report += _kv_row("• Net Delta Notional", f'{int(net_delta_notional):+,} KRW')
+    report += _kv_row("• Delta / Capital", f'{delta_capital_pct:+.1f}%')
     report += _kv_row("• Portfolio Gamma", f'{total_port_greeks["gamma"]:+.4f}')
     report += _kv_row("• Portfolio Theta",
                       f'{total_port_greeks["theta"]:+.4f} <span class="pill">Daily Decay: {int(total_port_greeks["theta"] * MULTIPLIER):,} KRW</span>')
@@ -2215,140 +2422,72 @@ def execution_reporter_greeks(state: QuantState):
     report += "</div></div></div>"
 
     # =========================
-    # 2) ✅ Positions 섹션 교체 코드
+    # Positions
     # =========================
     report += "<h3>📋 Positions</h3>"
-    report += '<div class="list">'
+    report += '<table style="border-collapse:collapse;width:100%;font-size:13px;">'
+    report += (
+        '<thead><tr style="background:#2c3e50;color:white;text-align:center;">'
+        '<th style="padding:6px 8px;text-align:left;">Name</th>'
+        '<th style="padding:6px 8px;">Type</th>'
+        '<th style="padding:6px 8px;">Option</th>'
+        '<th style="padding:6px 8px;">Strike</th>'
+        '<th style="padding:6px 8px;">Price</th>'
+        '<th style="padding:6px 8px;">Delta</th>'
+        '<th style="padding:6px 8px;">Gamma</th>'
+        '<th style="padding:6px 8px;">Weight</th>'
+        '<th style="padding:6px 8px;">Qty</th>'
+        '<th style="padding:6px 8px;">Role</th>'
+        '</tr></thead><tbody>'
+    )
 
     for p in positions:
-        # 기본 값
-        opt_type = str(p.get("option_type", "") or "")  # "Call" | "Put" | "Future"
+        opt_type = str(p.get("option_type", "") or "")
         opt_low = opt_type.strip().lower()
-
-        strike_val = float(p.get("strike", 0.0) or 0.0)  # 값은 유지
+        strike_val = float(p.get("strike", 0.0) or 0.0)
         price = float(p.get("price", 0.0) or 0.0)
         qty = int(p.get("qty", 0) or 0)
         weight_pct = float(p.get("weight", 0.0) or 0.0) * 100.0
         delta = float(p.get("delta", 0.0) or 0.0)
         gamma = float(p.get("gamma", 0.0) or 0.0)
-
         role = str(p.get("role", "") or "")
         role_low = role.lower()
         name = str(p.get("name", "") or "")
-
-        # =========================
-        # 2) ✅ Positions 루프 내부 패치 (정책 A)
-        # - is_hedge 계산한 뒤, title 출력 직전에 넣고
-        # - title 출력 1줄을 교체하세요.
-        # =========================
-        role_text = str(p.get("role", "") or "")
-        role_low = role_text.lower()
-
-        # 기존 is_hedge가 있다면 그대로 사용해도 OK
-        # (없다면 아래 라인 사용)
-        is_hedge = ("hedge" in role_low) or ("🛡️" in role_text)
-
-        # 정책 A: role 문자열에 main 키워드가 있을 때만 MAIN 배지
-        # is_main = ("main" in role_low) or ("core" in role_low) or ("primary" in role_low)
-
-        # =========================
-        # ✅ MAIN 배지 키워드 모드 (기본 wide, 나중에 tight로 전환)
-        # - 적용 위치: Positions 루프 내부, role_low 만든 직후
-        # - 기존 is_main 계산부를 이 블록으로 교체
-        # =========================
-
-        # 운영 권장:
-        # 1) 초기(표기 제각각)에는 wide로 누락 최소화
-        # 2) role 표기/데이터가 안정되면 tight로 전환(오탐 최소화)
-        MAIN_MODE = "wide"  # "wide" | "tight"
-
-        if MAIN_MODE == "tight":
-            main_keywords = ["main"]
-        else:
-            main_keywords = [
-                "main",
-                "main leg",
-                "main-leg",
-                "primary",
-                "primary leg",
-                "primary-leg",
-                "core",
-                "core leg",
-            ]
-
-        is_main = any(k in role_low for k in main_keywords)
-
-        badge_html = ""
-        if is_hedge:
-            badge_html = ' <span class="hedge-badge">HEDGE</span>'
-        elif is_main:
-            badge_html = ' <span class="main-badge">MAIN</span>'
-        else:
-            badge_html = ""  # ✅ 정책 A
-
-        # Type tag (Long/Short)
-        type_tag = '<span class="tag buy">Long</span>' if p.get(
-            "type") == "Long" else '<span class="tag sell">Short</span>'
-
-        # ✅ Call/Put/Future 아이콘/색상 태그
-        if opt_low == "call":
-            opt_tag = '<span class="tag call">📈 Call</span>'
-            kind_class = "call"
-        elif opt_low == "put":
-            opt_tag = '<span class="tag put">📉 Put</span>'
-            kind_class = "put"
-        elif opt_low == "future":
-            opt_tag = '<span class="tag future">🧩 Future</span>'
-            kind_class = "future"
-        else:
-            opt_tag = f'<span class="tag">{_html_escape(opt_type)}</span>'
-            kind_class = ""
-
-        # ✅ Future 포지션 Strike "표시만" — 로 변경
+        is_long = p.get("type") == "Long"
+        is_hedge = ("hedge" in role_low) or ("🛡️" in role)
         strike_display = "—" if opt_low == "future" else f"{strike_val:.1f}"
+        row_bg = "#fff8f0" if is_hedge else "#ffffff"
+        type_color = "#1565C0" if is_long else "#C62828"
+        if opt_low == "call":
+            opt_label = "📈 Call"
+            opt_color = "#2E7D32"
+        elif opt_low == "put":
+            opt_label = "📉 Put"
+            opt_color = "#AD1457"
+        elif opt_low == "future":
+            opt_label = "🧩 Future"
+            opt_color = "#E65100"
+        else:
+            opt_label = _html_escape(opt_type)
+            opt_color = "#555"
 
-        # 클래스 합성
-        classes = ["item"]
-        if kind_class:
-            classes.append(kind_class)
-        if is_hedge:
-            classes.append("hedge")
-        cls = " ".join(classes)
+        report += f'<tr style="background:{row_bg};text-align:center;">'
+        report += f'<td style="padding:5px 8px;text-align:left;font-weight:bold;">{_html_escape(name)}</td>'
+        report += f'<td style="padding:5px 8px;color:{type_color};font-weight:bold;">{"Long" if is_long else "Short"}</td>'
+        report += f'<td style="padding:5px 8px;color:{opt_color};">{opt_label}</td>'
+        report += f'<td style="padding:5px 8px;">{strike_display}</td>'
+        report += f'<td style="padding:5px 8px;">{price:.2f}</td>'
+        report += f'<td style="padding:5px 8px;">{delta:.2f}</td>'
+        report += f'<td style="padding:5px 8px;">{gamma:.3f}</td>'
+        report += f'<td style="padding:5px 8px;">{weight_pct:.1f}%</td>'
+        report += f'<td style="padding:5px 8px;">{qty}</td>'
+        report += f'<td style="padding:5px 8px;">{_html_escape(role)}</td>'
+        report += '</tr>'
 
-        report += f'<div class="{cls}">'
-        report += '<div class="top">'
-
-        # title 출력 라인 교체
-        # 기존:
-        # report += f'<div class="title">{_html_escape(name)}</div>'
-        # 교체:
-        report += f'<div class="title">{_html_escape(name)}{badge_html}</div>'
-
-        report += (
-            f'<div class="sub">'
-            f'{type_tag}'
-            f'{opt_tag}'
-            f'<span class="tag">Qty {qty}</span>'
-            f'<span class="tag">{weight_pct:.1f}%</span>'
-            f'</div>'
-        )
-        report += '</div>'
-
-        # 라벨/내용은 동일, Strike만 표시 변경
-        report += '<div class="grid2">'
-        report += f"<div class='row'><span class='k'>Strike: </span><span class='v'>{strike_display}</span></div>"
-        report += f"<div class='row'><span class='k'>Price: </span><span class='v'>{price:.2f}</span></div>"
-        report += f"<div class='row'><span class='k'>Delta: </span><span class='v'>{delta:.2f}</span></div>"
-        report += f"<div class='row'><span class='k'>Gamma: </span><span class='v'>{gamma:.3f}</span></div>"
-        report += f"<div class='row'><span class='k'>Role: </span><span class='v'>{_html_escape(role)}</span></div>"
-        report += "</div>"
-
-        report += "</div>"
-
-    report += "</div>"  # end positions list
+    report += '</tbody></table>'
 
     # =========================
-    # ✅ Expiry P&L: TABLE -> CARD LIST (TP/SL 강조)
+    # Expiry P&L
     # =========================
     report += "<h3>📊 Expiry P&L Scenario - Intrinsic Value Based</h3>"
     report += '<div class="list">'
@@ -2359,7 +2498,6 @@ def execution_reporter_greeks(state: QuantState):
         ret = (pnl / capital) * 100 if capital > 0 else 0.0
 
         status = "🎯 TP" if ret >= tp else ("🛑 SL" if ret <= -sl else "Active")
-        # 상태 tag + 카드 배경
         if "TP" in status:
             item_cls = "item tp"
             status_tag = '<span class="tag tp">🎯 TP</span>'
@@ -2370,7 +2508,6 @@ def execution_reporter_greeks(state: QuantState):
             item_cls = "item neutral" if change == 0.0 else "item"
             status_tag = '<span class="tag active">Active</span>'
 
-        # Return 색상(기존 tp/sl class 개념 유지)
         ret_tag = ""
         if ret >= tp:
             ret_tag = f'<span class="tag tp">{ret:+.2f}%</span>'
@@ -2393,7 +2530,7 @@ def execution_reporter_greeks(state: QuantState):
         report += "</div>"
         report += "</div>"
 
-    report += "</div>"  # end expiry list
+    report += "</div>"
     report += '<div class="mono muted">※ 본 시나리오는 만기 시점의 내재가치를 기준으로 하며, 중도 청산 시 그리스 변동에 따른 오차가 있을 수 있습니다.</div>'
 
     # ----- Risk & Margin card -----
@@ -2432,6 +2569,7 @@ def execution_reporter_greeks(state: QuantState):
 
     report += "</body></html>"
     # -------------------- [REPLACE END: HTML REPORT - NO TABLES LIST VIEW] --------------------
+
     consoleReport = f"\n{'=' * 0}\n🚀 [Scenario: {scenario_title}]\n\n"
     consoleReport += f"📊  LLM OPTION STRATEGY REPORT (Risk Controlled)\n{'=' * 0}\n"
     consoleReport += (f"• Date: {time.strftime('%Y-%m-%d %H:%M')}\n")
@@ -2467,10 +2605,13 @@ def execution_reporter_greeks(state: QuantState):
     consoleReport += f"• Net Premium      : {net_premium_str}\n\n"
 
     delta_pnl_1pct = total_port_greeks['delta'] * (kospi * 0.01) * MULTIPLIER
-    final_leverage = abs(total_port_greeks['delta'] * kospi * MULTIPLIER) / capital if capital > 0 else 0.0
+    final_leverage = abs(net_delta_notional) / capital if capital > 0 else 0.0
+    delta_capital_pct = (net_delta_notional / capital) * 100 if capital > 0 else 0.0
 
     consoleReport += f"🎯 [Strategy Analysis]\n\n• Direction        : {direction}\n"
     consoleReport += f"• Portfolio Delta  : {total_port_greeks['delta']:.2f} (Leverage: {final_leverage:.1f}x)\n"
+    consoleReport += f"• Net Delta Notional : {int(net_delta_notional):+,} KRW\n"
+    consoleReport += f"• Delta / Capital  : {delta_capital_pct:+.1f}%\n"
     consoleReport += f"• Portfolio Gamma  : {total_port_greeks['gamma']:+.4f}\n"
     consoleReport += f"• Portfolio Theta  : {total_port_greeks['theta']:+.4f} (Daily Decay: {int(total_port_greeks['theta'] * MULTIPLIER):,} KRW)\n"
     consoleReport += f"• Est. P&L (±1%)   : {int(delta_pnl_1pct):>+12,} KRW (Instant Move)\n"
@@ -2521,8 +2662,8 @@ def execution_reporter_greeks(state: QuantState):
 
     consoleReport += (f"{formatted_view}\n\n")
 
-
     return {"final_report": report, "console_report": consoleReport}
+
 
 def send_email_message(subject: str, body: str):
     sender = os.getenv("EMAIL_SENDER")
@@ -2530,35 +2671,28 @@ def send_email_message(subject: str, body: str):
     receiver_a = os.getenv("EMAIL_RECEIVER_A")
     receiver_b = os.getenv("EMAIL_RECEIVER_B")
 
-    if not sender or not password or not receiver_a or not receiver_b:
-        print("⚠️ [Notification] 이메일 설정이 누락되었습니다.")
+    if not sender or not password or not receiver_a:
+        print("⚠️ [Notification] 이메일 설정이 누락되었습니다. (EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER_A 필수)")
         return
 
+    # 수신자 목록 구성 (receiver_b는 선택)
+    recipients = [r for r in [receiver_a] if r]  # , receiver_b
+
+    msg = MIMEMultipart()
+    msg['From'] = sender
+    msg['To'] = ", ".join(recipients)
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'html'))
+
     try:
-        msg_a = MIMEMultipart()
-        msg_a['From'] = sender
-        msg_a['To'] = receiver_a
-        msg_a['Subject'] = subject
-        msg_a.attach(MIMEText(body, 'html'))  # HTML을 원하면 'html'로 변경
-
-        msg_b = MIMEMultipart()
-        msg_b['From'] = sender
-        msg_b['To'] = receiver_b
-        msg_b['Subject'] = subject
-        msg_b.attach(MIMEText(body, 'html'))  # HTML을 원하면 'html'로 변경
-
-        # Gmail SMTP 서버
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(sender, password)
-        server.sendmail(sender, receiver_a, msg_a.as_string())
-        # server.sendmail(sender, receiver_b, msg_b.as_string())
-        server.quit()
-
-        print(f"✅ [Notification] 이메일 전송 완료 ({receiver_a})")
-        # print(f"✅ [Notification] 이메일 전송 완료 ({receiver_b})")
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.starttls()
+            server.login(sender, password)
+            server.sendmail(sender, recipients, msg.as_string())
+        print(f"✅ [Notification] 이메일 전송 완료 -> {recipients}")
     except Exception as e:
         print(f"❌ [Notification] 이메일 전송 실패: {e}")
+
 
 def notifier_node(state: QuantState):
     report = state.get('final_report', "No Report Generated")
@@ -2572,26 +2706,21 @@ def notifier_node(state: QuantState):
 def learning_node(state: QuantState):
     """결과를 분석하여 성공적인 파라미터를 DB에 피드백"""
 
-    # 1. 수익률 추출 (Reporter에서 계산된 값 기준)
-    # 여기서는 시뮬레이션상의 'Index 0% 변동 시 Expected P&L'을 기준으로 평가한다고 가정
-    # (실제 계좌 수익률 변수를 사용하면 더 정확합니다)
-    state['expected_return_pct'] = 2.00
-
-    # 임시: Reporter 결과물에서 수익률 수치를 파싱하거나 State에 저장된 값을 사용
-    # 예시 임계값: 3.0% 이상의 수익이 예상되는 우수 조합일 때 학습
     target_profit = 3.0
-
-    # 실제로는 Reporter 노드에서 'expected_return_pct'를 state에 담아줘야 함
     current_perf = state.get('expected_return_pct', 0.0)
 
     if current_perf >= target_profit:
+        if scenario_manager is None:
+            print("⚠️ [Learning] scenario_manager 없음 - 저장 스킵")
+            return state
+
         print(f"🎯 [Learning] 수익률 {current_perf:.2f}% 확인. 우수 파라미터 학습 중...")
 
         scenario_manager.update_successful_scenario(
             view_text=state['manager_view'],
             mu=state['expected_returns'],
-            vol=state.get('vol_vector', [0.2] * 5),  # vol 데이터 추출
-            corr=state.get('correlation_matrix', []),  # correlation matrix
+            vol=state.get('vol_vector', [0.2] * 5),
+            corr=state.get('correlation_matrix', []),
             expected_ret=current_perf,
             anchor_name=state.get('anchor_name', 'Unknown_Anchor')
         )
@@ -2599,6 +2728,7 @@ def learning_node(state: QuantState):
         print(f"ℹ️ [Learning] 수익률 {current_perf:.2f}% - 학습 임계치 미달로 스킵.")
 
     return state
+
 
 # ---------------------------------------------------------
 # 5. Workflow 구성 (RAG 노드 삽입)
@@ -2641,8 +2771,6 @@ workflow.add_edge("Notifier", "Learning")
 workflow.add_edge("Learning", END)
 
 app = workflow.compile()
-
-
 
 
 # ---------------------------------------------------------
@@ -2703,7 +2831,7 @@ def get_forex_news():
 
 def get_kospi200_index() -> float:
     MANUAL_KOSPI_INDEX = 575.05
-    data = {"t2101InBlock": {"focode": "A0163000"}}
+    data = {"t2101InBlock": {"focode": "A0166000"}}
 
     try:
         res_json = ls_post_market_data("t2101", data, timeout=60)
@@ -2781,10 +2909,9 @@ def get_vkospi_data():
         return None
 
 
-def run_simulation(view_text, llm, trend, risk_level, news_data, test_news,
+def run_simulation(view_text, trend, risk_level, news_data, test_news,
                    news_sentiment="Neutral", is_price_rising=True, divergence_note="",
                    macro_pred: Optional[Dict[str, Any]] = None):
-
     kospi_realtime = get_kospi200_index()
 
     if kospi_realtime == 0:
@@ -2800,7 +2927,9 @@ def run_simulation(view_text, llm, trend, risk_level, news_data, test_news,
             print(f"{key}: {value}")
         print("-" * 30)
 
-        MARKET_IV = float(result['현재가'])
+        # MARKET_IV = float(result['현재가'])
+        MARKET_IV = float(str(result['현재가']).replace(",", "").strip())
+
     else:
         print("데이터를 가져오는데 실패했습니다. (Investing.com의 보안 정책에 의해 차단되었을 수 있습니다.)")
 
@@ -2947,43 +3076,188 @@ def build_manager_view_from_debate(
 # ---------------------------------------------------------
 # 1. 데이터 수집 (Data Fetching) - 기존과 동일
 # ---------------------------------------------------------
-def get_macro_data(start_date="2020-01-01"):
+
+def get_macro_data(api_key=None, start_date="2020-01-01"):
+    if api_key is None:
+        api_key = os.getenv("ALPHA_VANTAGE_KEY")
+
+    base_url = "https://www.alphavantage.co/query"
+    df_macro = pd.DataFrame()
+
+    print(f"\n📡 [Alpha Vantage] 데이터 수집 시작... (Key: {api_key[:5] if api_key else 'N/A'}***)")
+
+    economic_functions = {
+        'FED_RATE': 'FEDERAL_FUNDS_RATE',
+        'CPI': 'CPI',
+        'UNEMPLOYMENT': 'UNEMPLOYMENT',
+        'GDP': 'REAL_GDP',
+        'RETAIL_SALES': 'RETAIL_SALES',
+        'DURABLES': 'DURABLES'
+    }
+
+    for name, func in economic_functions.items():
+        success = False
+        retry_count = 0
+
+        while not success and retry_count < 2:
+            try:
+                params = {"function": func, "apikey": api_key, "datatype": "json"}
+                response = requests.get(base_url, params=params, timeout=15)
+                data = response.json()
+
+                if "Note" in data:
+                    print(f"⚠️ [API Limit] {name}: 15초 대기 후 재시도...")
+                    time.sleep(15)
+                    retry_count += 1
+                    continue
+
+                if "data" in data and len(data["data"]) > 0:
+                    temp_df = pd.DataFrame(data["data"])[['date', 'value']].copy()
+                    temp_df['date'] = pd.to_datetime(temp_df['date'])
+                    temp_df['value'] = pd.to_numeric(temp_df['value'], errors='coerce')
+                    temp_df = temp_df.dropna(subset=['date'])
+                    temp_df = temp_df.drop_duplicates(subset=['date'], keep='first')
+                    temp_df = temp_df.sort_values('date').set_index('date')
+                    temp_df = temp_df.rename(columns={'value': name})
+
+                    if df_macro.empty:
+                        df_macro = temp_df
+                    else:
+                        df_macro = df_macro.join(temp_df, how='outer')
+
+                    print(f"✅ [Success] {name}: {len(temp_df)} rows 수집.")
+                    success = True
+                else:
+                    print(f"❌ [Fail] {name}: 응답 데이터 없음. (스킵하고 계속 진행)")
+                    break
+
+            except Exception as e:
+                print(f"⚠️ [Error] {name}: {e}")
+                break
+
+            time.sleep(12)
+
+    for name in economic_functions.keys():
+        if name not in df_macro.columns:
+            df_macro[name] = np.nan
+
     tickers = {
         'KOSPI200': '^KS200',
         'S&P500': '^GSPC',
         'NASDAQ': '^IXIC',
         'SOX': '^SOX',
+        'Nikkei225': '^N225',
         'USD_KRW': 'KRW=X',
         'US_10Y': '^TNX',
         'WTI_Oil': 'CL=F',
         'VIX': '^VIX'
     }
 
-    df = pd.DataFrame()
-
-    print("데이터 다운로드 중...")
+    print("📡 yfinance 데이터 수집 중...")
     for name, ticker in tickers.items():
         try:
-            data = yf.download(ticker, start=start_date, progress=False)
-            if 'Adj Close' in data.columns:
-                val = data['Adj Close']
-            elif 'Close' in data.columns:
-                val = data['Close']
-            else:
-                val = data.iloc[:, 0]
+            data = yf.download(ticker, start=start_date, progress=False, auto_adjust=False)
 
-            # Series 형태로 확실하게 변환
-            if isinstance(val, pd.DataFrame):
-                val = val.squeeze()
-            df[name] = val
+            if not data.empty:
+                if isinstance(data.columns, pd.MultiIndex):
+                    data.columns = data.columns.get_level_values(0)
 
+                val = data['Adj Close'] if 'Adj Close' in data.columns else data['Close']
+                temp_yf = val.to_frame(name=name)
+                temp_yf.index = pd.to_datetime(temp_yf.index)
+                temp_yf = temp_yf[~temp_yf.index.duplicated(keep='first')]
+
+                if df_macro.empty:
+                    df_macro = temp_yf
+                else:
+                    df_macro = df_macro.join(temp_yf, how='outer')
+
+                print(f"✅ [Success] {name} 수집 완료.")
         except Exception as e:
-            print(f"⚠️ {name} 데이터 처리 중 오류: {e}")
+            print(f"⚠️ {name} 수집 오류: {e}")
 
-    # [중요] ffill로 결측치를 채우되, 맨 앞의 결측치는 제거
+    if df_macro.empty:
+        return pd.DataFrame()
 
-    df = df.ffill().dropna()
-    return df
+    df_macro = df_macro.sort_index()
+    df_macro = df_macro[~df_macro.index.duplicated(keep='first')]
+
+    # 월간/분기 지표를 거래일로 확장
+    df_macro = df_macro.ffill()
+
+    if 'KOSPI200' in df_macro.columns:
+        kospi_idx = df_macro['KOSPI200'].dropna().index
+        df_macro = df_macro.reindex(kospi_idx).ffill().bfill()
+
+    print(f"🎯 [Data Sync] 최종 가용 데이터: {len(df_macro)} 거래일 확보")
+    return df_macro
+
+
+# 1. 컬럼 분류 (박사님의 설정을 그대로 유지)
+price_cols = ['KOSPI200', 'S&P500', 'NASDAQ', 'SOX', 'Nikkei225', 'USD_KRW', 'WTI_Oil']
+level_cols = ['US_10Y', 'VIX', 'FED_RATE', 'CPI', 'UNEMPLOYMENT', 'GDP', 'RETAIL_SALES', 'DURABLES']
+
+
+# ---------------------------------------------------------
+# 2. 발표 시차(Publication Lag) 반영 전처리 함수 (기존 유지)
+# ---------------------------------------------------------
+def process_data_with_sync(df):
+    macro_lags = {
+        'CPI': 20,
+        'UNEMPLOYMENT': 10,
+        'GDP': 45,
+        'RETAIL_SALES': 15,
+        'DURABLES': 20
+    }
+
+    processed_df = pd.DataFrame(index=df.index)
+
+    # 1. 가격 지수 -> 로그 수익률
+    price_indices = ['KOSPI200', 'S&P500', 'NASDAQ', 'SOX', 'Nikkei225', 'USD_KRW', 'WTI_Oil']
+    for col in price_indices:
+        if col in df.columns:
+            processed_df[col] = np.log(df[col] / df[col].shift(1))
+
+    # 2. 수준값 지표
+    level_indices = ['VIX', 'US_10Y', 'FED_RATE']
+    for col in level_indices:
+        if col in df.columns:
+            processed_df[col] = df[col]
+
+    # 3. 거시 지표 -> Lag 반영 후 다시 ffill()
+    for col, lag in macro_lags.items():
+        if col in df.columns:
+            processed_df[col] = df[col].shift(lag).ffill()
+
+    # 4. 다음 거래일 KOSPI 로그수익률을 타깃으로 설정
+    processed_df['TARGET_NEXT_KOSPI'] = processed_df['KOSPI200'].shift(-1)
+
+    # 5. 피처 생성
+    feature_df = pd.DataFrame(index=processed_df.index)
+
+    # 해외 가격 변수는 T-1
+    lagged_price_cols = ['S&P500', 'NASDAQ', 'SOX', 'USD_KRW', 'WTI_Oil']
+    for col in lagged_price_cols:
+        if col in processed_df.columns:
+            feature_df[f"{col}_Lag1"] = processed_df[col].shift(1)
+
+    # 수준값/거시값도 T-1
+    lagged_level_cols = ['VIX', 'US_10Y', 'FED_RATE', 'CPI', 'UNEMPLOYMENT', 'GDP', 'RETAIL_SALES', 'DURABLES']
+    for col in lagged_level_cols:
+        if col in processed_df.columns:
+            feature_df[f"{col}_Lag1"] = processed_df[col].shift(1)
+
+    # 니케이 동조화 처리
+    if 'Nikkei225' in processed_df.columns:
+        feature_df['Nikkei225_Sync'] = processed_df['Nikkei225']
+
+    # 6. 최종 병합 및 유실 방지
+    model_data = pd.concat([processed_df[['TARGET_NEXT_KOSPI']], feature_df], axis=1).dropna()
+
+    print(f"📉 [Pre-process] 최종 Ridge 학습 가용 데이터: {len(model_data)}행")
+
+    feature_cols = feature_df.columns.tolist()
+    return model_data, feature_cols
 
 
 # ---------------------------------------------------------
@@ -3048,59 +3322,136 @@ def analyze_correlation(model_data):
     plt.show()
 
 
+# ---------------------------------------------------------
+# 1. 지표별 발표 지연(Publication Lag) 반영 전처리
+# ---------------------------------------------------------
+def process_data_with_publication_lag(df):
+    """
+    Look-ahead Bias 제거 및 하이브리드 피처 생성:
+    - 가격 데이터: 로그 수익률 (Log Return)
+    - 금리/변동성: 수준값 (Level)
+    - 거시 지표: 수준값 + 실제 발표 지연(Publication Lag) 반영
+    """
+    # [설정] 거시 지표별 평균적 발표 지연 일수 (보수적 기준)
+    # 실제로는 공표일 캘린더를 연동하는 것이 좋으나, 고정 Lag로도 편향을 크게 줄임
+    macro_lags = {
+        'CPI': 20,  # 전월 데이터가 약 20일 뒤 발표
+        'UNEMPLOYMENT': 10,  # 약 10일 뒤 발표
+        'GDP': 50,  # 분기 종료 후 약 50일 뒤 (속보치)
+        'RETAIL_SALES': 15,
+        'DURABLES': 25
+        # 'SENTIMENT': 1  # 심리지수는 보통 월말 발표되므로 짧게 설정
+    }
+
+    # 지표 분류
+    price_indices = ['KOSPI200', 'S&P500', 'NASDAQ', 'SOX', 'Nikkei225', 'USD_KRW', 'WTI_Oil']
+    realtime_levels = ['VIX', 'US_10Y', 'FED_RATE']
+
+    processed_df = pd.DataFrame(index=df.index)
+
+    # 1. 가격 지수 -> 로그 수익률
+    for col in price_indices:
+        if col in df.columns:
+            processed_df[col] = np.log(df[col] / df[col].shift(1))
+
+    # 2. 실시간 금리/변동성 -> 수준값(Level) 그대로
+    for col in realtime_levels:
+        if col in df.columns:
+            processed_df[col] = df[col]
+
+    # 3. [핵심] 거시 경제 지표 -> 발표 지연 반영 (Look-ahead Bias 제거)
+    for col, lag in macro_lags.items():
+        if col in df.columns:
+            # 해당 날짜에 실제로 가용했던 '과거 값'을 매핑
+            processed_df[col] = df[col].shift(lag)
+
+    # 4. 타겟(KOSPI) 및 피처 정렬
+    target_col = 'KOSPI200'
+    y = processed_df[[target_col]]
+    X_raw = processed_df.drop(columns=[target_col])
+
+    # (A) Nikkei: 동시간대 동조화 (T 시점)
+    X_sync = X_raw[['Nikkei225']].rename(columns={'Nikkei225': 'Nikkei225_Sync'})
+
+    # (B) 나머지 지표들: 전일 가용 데이터 (T-1 시점)
+    # 이미 macro_lags로 밀린 데이터들도 T-1 시점에 알고 있어야 하므로 한번 더 shift
+    X_lagged = X_raw.drop(columns=['Nikkei225']).shift(1)
+    X_lagged.columns = [f"{col}_Lag1" for col in X_lagged.columns]
+
+    model_data = pd.concat([y, X_lagged, X_sync], axis=1).dropna()
+    feature_cols = X_lagged.columns.tolist() + X_sync.columns.tolist()
+
+    return model_data, feature_cols
+
+
+# ---------------------------------------------------------
+# 3. Ridge 분석 실행 함수 (Inference 부분 수정)
+# ---------------------------------------------------------
 def run_analysis_return(current_realtime_kospi, start_date="2020-01-01", alpha=1.0, train_ratio=0.85, show_corr=False):
-    # 1) 데이터 수집
-    raw_df = get_macro_data(start_date=start_date)
+    raw_df = get_macro_data(api_key=os.getenv("ALPHA_VANTAGE_KEY"), start_date=start_date)
+    raw_df = raw_df[['KOSPI200', 'S&P500', 'NASDAQ', 'SOX', 'Nikkei225', 'USD_KRW', 'US_10Y',
+                     'WTI_Oil', 'VIX']]
 
-    # 2) T vs T-1 정렬
-    model_data, feature_cols = process_data(raw_df)
+    if raw_df is None or raw_df.empty:
+        raise ValueError("raw_df가 비어 있습니다.")
 
-    # (선택) 상관관계 시각화
+    model_data, feature_cols = process_data_with_sync(raw_df)
+
+    if len(model_data) < 200:
+        raise ValueError(f"학습 데이터가 너무 적습니다: {len(model_data)} rows")
+
     if show_corr:
-        analyze_correlation(model_data)
+        corr_data = model_data.rename(columns={'TARGET_NEXT_KOSPI': 'KOSPI200'})
+        analyze_correlation(corr_data)
 
-    # 3) 학습/테스트 분리 (시계열 유지)
-    X = model_data[feature_cols]
-    y = model_data['KOSPI200']
+    # 마지막 row를 inference input으로 사용
+    # 그 이전 row들로만 학습/검증
+    trainable_data = model_data.iloc[:-1].copy()
+    inference_row = model_data.iloc[[-1]].copy()
 
-    split = int(len(model_data) * train_ratio)
-    X_train, X_test = X.iloc[:split], X.iloc[split:]
-    y_train, y_test = y.iloc[:split], y.iloc[split:]
+    if len(trainable_data) < 200:
+        raise ValueError(f"학습용 데이터가 너무 적습니다: {len(trainable_data)} rows")
 
-    model = Ridge(alpha=alpha)
-    model.fit(X_train, y_train)
+    X_all = trainable_data[feature_cols]
+    y_all = trainable_data['TARGET_NEXT_KOSPI']
 
-    # 4) 성능(참고용)
-    preds = model.predict(X_test)
+    split = int(len(trainable_data) * train_ratio)
+    X_train, X_test = X_all.iloc[:split], X_all.iloc[split:]
+    y_train, y_test = y_all.iloc[:split], y_all.iloc[split:]
+
+    if len(X_test) == 0:
+        raise ValueError("테스트 데이터가 비어 있습니다. train_ratio를 조정하세요.")
+
+    model_pipeline = Pipeline([
+        ('scaler', StandardScaler()),
+        ('ridge', Ridge(alpha=alpha))
+    ])
+
+    model_pipeline.fit(X_train, y_train)
+
+    preds = model_pipeline.predict(X_test)
     rmse = float(np.sqrt(mean_squared_error(y_test, preds)))
     acc = float(np.mean(np.sign(preds) == np.sign(y_test.values)))
 
-    # 5) "다음 거래일" 예측 입력 구성: 최신 매크로 변수의 '오늘/어제' 로그수익률
-    last_row = raw_df.iloc[-1]
-    prev_row = raw_df.iloc[-2]
+    # 마지막 feature row를 그대로 추론 입력으로 사용
+    input_df = inference_row[feature_cols]
+    pred_log_ret = float(model_pipeline.predict(input_df)[0])
 
-    original_feature_names = [col.replace('_Lag1', '') for col in feature_cols]
-    input_features = []
-    for name in original_feature_names:
-        val_t = float(last_row[name])
-        val_t_1 = float(prev_row[name])
-
-        if val_t_1 == 0: val_t_1 = val_t
-        input_features.append(np.log(val_t / val_t_1))
-
-    pred_log_ret = float(model.predict([input_features])[0])
-    pred_pct = float((np.exp(pred_log_ret) - 1) * 100)
-
-    # current_kospi = float(raw_df['KOSPI200'].iloc[-1])
+    pred_pct = float((np.exp(pred_log_ret) - 1.0) * 100.0)
     next_kospi = float(current_realtime_kospi * np.exp(pred_log_ret))
 
     return {
         "pred_log_ret": pred_log_ret,
         "pred_pct": pred_pct,
-        "current_kospi": current_realtime_kospi,
+        "current_kospi": float(current_realtime_kospi),
         "next_kospi": next_kospi,
         "rmse": rmse,
         "directional_acc": acc,
+        "feature_date": str(inference_row.index[0].date()) if hasattr(inference_row.index[0], "date") else str(
+            inference_row.index[0]),
+        "n_train": int(len(X_train)),
+        "n_test": int(len(X_test)),
+        "n_total_model_data": int(len(model_data)),
     }
 
 
@@ -3110,103 +3461,228 @@ def run_analysis_return(current_realtime_kospi, start_date="2020-01-01", alpha=1
 #   DivergenceChecker가 manager_view에서 근거를 더 잘 읽도록 구성
 # ---------------------------------------------------------
 def bull_agent_node(state: DebateState):
-    """상승론자: 호재를 중심으로 시장을 분석"""
-    prompt = f"""
-        You are a 'Bullish Market Strategist'.
-        Aggressively argue both in English and Korean why the market will rise.
+    retry_feedback = ""
+    if state.get("retry_count", 0) > 0 and state.get("eval_critique"):
+        retry_feedback = f"\n[이전 피드백]\n{state.get('eval_critique', '')}\n"
 
-        Rules:
-        - Keep it concise and actionable.
-        - Mention liquidity/earnings/technical support.
-        - If news is negative but price action is strong, explicitly call it "Bullish Resilience" or "Bullish Climber".
+    prompt = f"""
+        You are a Bullish Market Strategist.
+
+        Task:
+        - Read the news context carefully.
+        - Build a bullish case ONLY from facts explicitly contained in the news context.
+        - Do NOT invent events, prices, yields, wars, oil levels, policy actions, or technical indicators not mentioned in the news.
+        - If bullish evidence is weak, say so clearly.
+        - Output in Korean.
+        - Keep it short.
+        {retry_feedback}
+
+        Required format:
+        [핵심 상승 논거]
+        - ...
+        - ...
+        [한계]
+        - ...
 
         News context:
         {state.get("news_context", "")}
         """.strip()
 
-    response = llm.invoke([HumanMessage(content=prompt)])
-    return {"bull_opinion": response.content}
+    response_text = safe_llm_text([HumanMessage(content=prompt)], fallback="상승 논거 생성 실패")
+    return {"bull_opinion": response_text}
+
 
 
 def bear_agent_node(state: DebateState):
-    """하락론자: 악재를 중심으로 시장을 분석"""
-    prompt = f"""
-        You are a 'Bearish Risk Analyst'.
-        Aggressively argue both in English and Korean why the market will fall.
+    retry_feedback = ""
+    if state.get("retry_count", 0) > 0 and state.get("eval_critique"):
+        retry_feedback = f"\n[이전 피드백]\n{state.get('eval_critique', '')}\n"
 
-        Rules:
-        - Keep it concise and actionable.
-        - Mention inflation/rates/geopolitics/valuation.
-        - If news is positive but price action is weak, explicitly call it "Bearish Exhaustion".
+    prompt = f"""
+        You are a Bearish Risk Analyst.
+
+        Task:
+        - Read the news context carefully.
+        - Build a bearish case ONLY from facts explicitly contained in the news context.
+        - Do NOT invent events, prices, yields, wars, oil levels, policy actions, or technical indicators not mentioned in the news.
+        - If bearish evidence is weak, say so clearly.
+        - Output in Korean.
+        - Keep it short.
+        {retry_feedback}
+
+        Required format:
+        [핵심 하락 논거]
+        - ...
+        - ...
+        [한계]
+        - ...
 
         News context:
         {state.get("news_context", "")}
         """.strip()
 
-    response = llm.invoke([HumanMessage(content=prompt)])
-    return {"bear_opinion": response.content}
+    response_text = safe_llm_text([HumanMessage(content=prompt)], fallback="하락 논거 생성 실패")
+    return {"bear_opinion": response_text}
 
 
 def consensus_judge_node(state: DebateState):
-    """
-    심판(CIO): Bull/Bear의 논거를 검토하고, Pydantic Schema를 통해
-    구조화된 최종 투자 전략을 도출합니다.
-    """
+    print("⚖️ [Judge] 심판 노드 시작")
 
-    # 구조화된 출력을 지원하도록 LLM 바인딩
-    structured_llm = llm.with_structured_output(JudgeOutput)
+    bull_text = (state.get("bull_opinion", "") or "")[:1200]
+    bear_text = (state.get("bear_opinion", "") or "")[:1200]
 
-    prompt = f"""
-    You are the 'Chief Investment Officer' for the OptiQ systematic trading system.
-    Review and synthesize the following arguments to reach a final execution decision.
-
-    [Bullish Argument]:
-    {state.get("bull_opinion", "No bull opinion provided.")}
-
-    [Bearish Argument]:
-    {state.get("bear_opinion", "No bear opinion provided.")}
-
-    [Mission]:
-    1. 양측의 논거 중 현재 시장 상황(Volatility, Liquidity)에 더 부합하는 쪽을 채택하거나 절충하십시오.
-    2. final_consensus 작성 시, 반드시 하단에 '[Divergence]' 섹션을 명시하여 뉴스 심리와 가격 지표 간의 괴리 여부를 기술하십시오.
-    3. 모든 분석은 한국어로 작성하되, 기술 용어는 원문을 유지하십시오.
+    example_json = """
+    {
+      "final_consensus": "한국어 결론",
+      "market_trend": "Neutral",
+      "risk_score": 5.5,
+      "news_sentiment": "Neutral",
+      "divergence_note": "한국어 괴리 설명"
+    }
     """.strip()
 
+    prompt = (
+        "You are the Chief Investment Officer for the OptiQ systematic trading system.\n"
+        "Use ONLY the evidence contained in the arguments below.\n"
+        "Do NOT introduce any new macro facts, events, price levels, yields, wars, oil prices, or technical indicators.\n\n"
+        f"[Bullish Argument]\n{bull_text}\n\n"
+        f"[Bearish Argument]\n{bear_text}\n\n"
+        "Return ONLY valid JSON with keys:\n"
+        "final_consensus, market_trend, risk_score, news_sentiment, divergence_note\n\n"
+        f"Example:\n{example_json}\n\n"
+        "Rules:\n"
+        "- market_trend must be one of: Bullish, Bearish, Volatile, Neutral\n"
+        "- news_sentiment must be one of: Positive, Negative, Neutral\n"
+        "- risk_score must be a number between 1 and 10\n"
+        "- final_consensus must be in Korean\n"
+        "- divergence_note must be in Korean\n"
+        "- no markdown\n"
+        "- no explanation\n"
+        "- JSON only"
+    )
+
     try:
-        # LLM 호출 (이미 JSON 객체로 반환됨)
-        response: JudgeOutput = structured_llm.invoke([HumanMessage(content=prompt)])
+        print("⚖️ [Judge] LLM 호출 직전")
+        raw = safe_llm_text([HumanMessage(content=prompt)], fallback="")
+        print(f"🔍 [Judge RAW]\n{raw}")
 
-        # ---------------------------------------------------------
-        # [Fix] 중복 태그 방지 및 포맷 정규화 로직
-        # ---------------------------------------------------------
+        data = extract_json_block(raw)
+        if not data:
+            raise ValueError("Judge JSON 파싱 실패")
 
-        # 1. LLM이 final_consensus 본문에 스스로 [Divergence]를 적은 경우, 그 뒷부분을 잘라냄 (중복 방지)
-        clean_consensus = response.final_consensus.split("[Divergence]")[0].strip()
+        final_consensus = str(
+            data.get("final_consensus", "데이터 분석 오류로 인한 보수적 관망 유지.")
+        ).strip()
 
-        # 2. divergence_note 내용 자체에 태그가 포함된 경우 제거
-        clean_note = response.divergence_note.replace("[Divergence]", "").strip()
+        market_trend = str(data.get("market_trend", "Neutral")).strip().capitalize()
 
-        # 3. 깔끔하게 재조립 (헤더는 딱 한 번만 들어가게 됨)
+        try:
+            risk_score = float(data.get("risk_score", 5.5))
+        except Exception:
+            risk_score = 5.5
+
+        news_sentiment = normalize_sentiment_label(data.get("news_sentiment", "Neutral"))
+        divergence_note = str(
+            data.get("divergence_note", "LLM 응답 파싱 실패로 인한 폴백 데이터 생성")
+        ).strip()
+
+        clean_consensus = final_consensus.split("[Divergence]")[0].strip()
+        clean_note = divergence_note.replace("[Divergence]", "").strip()
         final_text = f"{clean_consensus}\n\n[Divergence]\n{clean_note}"
 
         return {
             "final_consensus": final_text,
-            "market_trend": response.market_trend,
-            "risk_score": response.risk_score,
-            "news_sentiment": response.news_sentiment,
-            "divergence_note": clean_note,  # 정제된 노트 전달
+            "market_trend": market_trend,
+            "risk_score": risk_score,
+            "news_sentiment": news_sentiment,
+            "divergence_note": clean_note,
         }
 
     except Exception as e:
-        print(f"❌ [Critical] Structured Output Generation Failed: {e}")
-        # 시스템 중단을 막기 위한 최소한의 안전 장치 (Deterministic Fallback)
+        print(f"❌ [Critical] Judge Generation Failed: {e}")
         return {
-            "final_consensus": "데이터 분석 오류로 인한 보수적 관망 유지.\n\n[Divergence]\n판단 불가.",
+            "final_consensus": "데이터 분석 오류로 인한 보수적 관망 유지.\n\n[Divergence]\n판단 근거 부족",
             "market_trend": "Neutral",
             "risk_score": 5.5,
             "news_sentiment": "Neutral",
-            "divergence_note": "LLM 응답 파싱 실패로 인한 폴백 데이터 생성"
+            "divergence_note": "판단 근거 부족"
         }
+
+def evaluator_node(state: DebateState):
+    prompt = f"""
+        당신은 금융 리포트 감사관입니다.
+        아래 [원본 뉴스]와 [최종 합의문]을 비교해서 품질을 평가하세요.
+
+        반드시 JSON만 반환하세요.
+        키는 score, is_sufficient, critique 입니다.
+
+        조건:
+        - score: 1~10 정수
+        - is_sufficient: true 또는 false
+        - critique: 한국어
+        - JSON only
+        - no markdown
+
+        [원본 뉴스]
+        {state.get("news_context", "")}
+
+        [최종 합의문]
+        {state.get("final_consensus", "")}
+
+        예시:
+        {{
+          "score": 8,
+          "is_sufficient": true,
+          "critique": "핵심 뉴스 반영이 충분하며 추가 보완이 크지 않습니다."
+        }}
+        """.strip()
+
+    retry_cnt = state.get("retry_count", 0)
+
+    try:
+        raw = safe_llm_text([HumanMessage(content=prompt)], fallback="")
+        data = extract_json_block(raw)
+        if not data:
+            raise ValueError("Evaluator JSON 파싱 실패")
+
+        score = int(float(data.get("score", 6)))
+
+        raw_sufficient = data.get("is_sufficient", False)
+        if isinstance(raw_sufficient, bool):
+            is_sufficient = raw_sufficient
+        else:
+            is_sufficient = str(raw_sufficient).strip().lower() == "true"
+
+        critique = str(data.get("critique", "보완 의견 없음")).strip()
+
+    except Exception as e:
+        print(f"⚠️ [Evaluator] Error: {e}")
+        score = 6
+        is_sufficient = True if retry_cnt >= 2 else False
+        critique = "평가기 응답 파싱 실패"
+
+    if retry_cnt >= 2:
+        is_sufficient = True
+
+    result = {
+        "eval_score": score,
+        "is_sufficient": is_sufficient,
+        "eval_critique": critique,
+        "retry_count": retry_cnt + 1
+    }
+
+    print("\n[DEBUG] evaluator result:")
+    print(result)
+
+    return result
+
+
+def decide_refinement(state: DebateState):
+    if state.get("is_sufficient"):
+        return "approved"
+
+    print(f"🔄 [Self-Improvement] 품질 미달(점수:{state.get('eval_score')}). 재토론 진입...")
+    return "refine"
 
 def _normalize_trend(trend: str) -> str:
     t = str(trend).strip().lower()
@@ -3221,15 +3697,25 @@ def _normalize_trend(trend: str) -> str:
         return "volatile"
     return "neutral"
 
+
 debate_workflow = StateGraph(DebateState)
 debate_workflow.add_node("Bull", bull_agent_node)
 debate_workflow.add_node("Bear", bear_agent_node)
 debate_workflow.add_node("Judge", consensus_judge_node)
+debate_workflow.add_node("Evaluate", evaluator_node)
 
 debate_workflow.set_entry_point("Bull")
 debate_workflow.add_edge("Bull", "Bear")
 debate_workflow.add_edge("Bear", "Judge")
-debate_workflow.add_edge("Judge", END)
+debate_workflow.add_edge("Judge", "Evaluate")
+debate_workflow.add_conditional_edges(
+    "Evaluate",
+    decide_refinement,
+    {
+        "refine": "Bull",
+        "approved": END
+    }
+)
 
 debate_app = debate_workflow.compile()
 
@@ -3259,8 +3745,21 @@ def job():
                  for row in test_news]
             )
 
-            debate_inputs: DebateState = {"news_context": news_context}
+            print("\n📰 [DEBUG news_context]")
+            print(news_context[:3000])
+
+            # debate_inputs: DebateState = {"news_context": news_context}
+            debate_inputs: DebateState = {
+                "news_context": news_context,
+                "retry_count": 0,
+                "eval_critique": ""
+            }
             debate_result = debate_app.invoke(debate_inputs)
+            print("\n🧪 [Debate Evaluation]")
+            print(f" - eval_score     : {debate_result.get('eval_score')}")
+            print(f" - is_sufficient  : {debate_result.get('is_sufficient')}")
+            print(f" - eval_critique  : {debate_result.get('eval_critique')}")
+            print(f" - retry_count    : {debate_result.get('retry_count')}")
 
             bull_op = (debate_result.get("bull_opinion") or "").strip()
             bear_op = (debate_result.get("bear_opinion") or "").strip()
@@ -3270,7 +3769,8 @@ def job():
             normalized_trend = _normalize_trend(market_trend_str)
 
             risk_score = float(debate_result.get("risk_score", 5.0))
-            news_sentiment = str(debate_result.get("news_sentiment", "Neutral")).strip().capitalize()
+            # news_sentiment = str(debate_result.get("news_sentiment", "Neutral")).strip().capitalize()
+            news_sentiment = normalize_sentiment_label(debate_result.get("news_sentiment", "Neutral"))
             divergence_note = str(debate_result.get("divergence_note", "")).strip()
 
             # 가격 액션(외부 연동 전): 기존 코드 컨셉 유지
@@ -3335,11 +3835,19 @@ def job():
             }
             insert_market_scenario(mock_scenario)
 
+            dynamic_risk = compute_dynamic_risk_score(
+                llm_score=risk_score,
+                macro_pred=macro_pred,
+                news_sentiment=news_sentiment,
+                is_price_rising=is_price_rising,
+                market_trend=normalized_trend,
+                divergence_note=divergence_note,
+            )
+
             run_simulation(
                 view_text=view_text,
-                llm=llm,
                 trend=normalized_trend,
-                risk_level=risk_score,
+                risk_level=dynamic_risk,
                 news_data=news_data,
                 test_news=test_news,
                 news_sentiment=news_sentiment,
@@ -3357,18 +3865,21 @@ def job():
     print(f"✅ [Scheduler] 작업 종료. 다음 실행 대기 중...\n")
 
 
-
-
 if __name__ == "__main__":
     # 전역 변수를 수정하기 위해 global 키워드 명시
     # global scenario_manager
 
-    # 1. DB 시나리오 매니져 초기화
     print("🚀 [System] 시나리오 지식 베이스 초기화 중...")
-    scenario_manager = ScenarioManager(db_pool, embeddings)
 
-    # 2. 시나리오 데이터 로드 및 벡터화
-    scenario_manager.load_and_index_scenarios()
+    scenario_manager = None
+    try:
+        # 1. DB 시나리오 매니져 초기화
+        scenario_manager = ScenarioManager(db_pool, embeddings)
+        # 2. 시나리오 데이터 로드 및 벡터화
+        scenario_manager.load_and_index_scenarios()
+    except Exception as e:
+        print(f"⚠️ [Scenario] 초기화 실패: {e}")
+        scenario_manager = None
 
     job()
 
